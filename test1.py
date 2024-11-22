@@ -1,10 +1,18 @@
+from transformers import AutoTokenizer, AutoModelForCausalLM
+tokenizer = AutoTokenizer.from_pretrained("gpt2")
+model = AutoModelForCausalLM.from_pretrained("gpt2")
+for name, module in model.named_modules():
+    print(name, "->", module)
+print("===========================")
+# 查看参数名
+for name, param in model.named_parameters():
+    print(name, param.shape)
 
-from transformers import T5Tokenizer, T5ForConditionalGeneration
+# 查看具体层的参数
+#print(model.state_dict()["transformer.h.0.attn.c_proj.weight"])
 
-tokenizer = T5Tokenizer.from_pretrained("google/flan-t5-base")
-model = T5ForConditionalGeneration.from_pretrained("google/flan-t5-base")
-
-input_text = "translate English to German: How old are you?"
-input_ids = tokenizer(input_text, return_tensors="pt").input_ids
-outputs = model.generate(input_ids)
-print(tokenizer.decode(outputs[0]))
+#prompt = "hello world, my name is"
+#input_ids = tokenizer(prompt, return_tensors="pt"). input_ids
+#print(input_ids)
+#outputs = model(input_ids)
+#print(outputs.logits.shape)

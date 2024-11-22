@@ -1,7 +1,5 @@
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig
-from torch.autograd import Variable
-from torchviz import make_dot
 
 model_name = "deepseek-ai/deepseek-moe-16b-base"
 tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
