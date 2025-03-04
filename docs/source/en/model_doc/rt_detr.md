@@ -16,6 +16,10 @@ rendered properly in your Markdown viewer.
 
 # RT-DETR
 
+<div class="flex flex-wrap space-x-1">
+<img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-DE3412?style=flat&logo=pytorch&logoColor=white">
+</div>
+
 ## Overview
 
 
@@ -57,7 +61,7 @@ Initially, an image is processed using a pre-trained convolutional neural networ
 >>> with torch.no_grad():
 ...     outputs = model(**inputs)
 
->>> results = image_processor.post_process_object_detection(outputs, target_sizes=torch.tensor([image.size[::-1]]), threshold=0.3)
+>>> results = image_processor.post_process_object_detection(outputs, target_sizes=torch.tensor([(image.height, image.width)]), threshold=0.3)
 
 >>> for result in results:
 ...     for score, label_id, box in zip(result["scores"], result["labels"], result["boxes"]):
