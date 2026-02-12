@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2024 The HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,42 +15,25 @@
 Processor class for Qwen2Audio.
 """
 
-from typing import List, Optional, Union
-
 import numpy as np
 
 from ...feature_extraction_utils import BatchFeature
-from ...processing_utils import ProcessorMixin
-from ...tokenization_utils_base import PaddingStrategy, PreTokenizedInput, TextInput
+from ...processing_utils import ProcessingKwargs, ProcessorMixin, Unpack
+from ...tokenization_utils_base import PreTokenizedInput, TextInput
+from ...utils import auto_docstring
 
 
+class Qwen2AudioProcessorKwargs(ProcessingKwargs, total=False):
+    _defaults = {
+        "text_kwargs": {
+            "padding": False,
+        },
+        "audio_kwargs": {},
+    }
+
+
+@auto_docstring
 class Qwen2AudioProcessor(ProcessorMixin):
-    r"""
-    Constructs a Qwen2Audio processor which wraps a Qwen2Audio feature extractor and a Qwen2Audio tokenizer into a single processor.
-
-    [`Qwen2AudioProcessor`] offers all the functionalities of [`WhisperFeatureExtractor`] and [`Qwen2TokenizerFast`]. See the
-    [`~Qwen2AudioProcessor.__call__`] and [`~Qwen2AudioProcessor.decode`] for more information.
-
-    Args:
-        feature_extractor ([`WhisperFeatureExtractor`], *optional*):
-            The feature extractor is a required input.
-        tokenizer ([`Qwen2TokenizerFast`], *optional*):
-            The tokenizer is a required input.
-        chat_template (`Optional[str]`, *optional*):
-                The Jinja template to use for formatting the conversation. If not provided, the default chat template
-                is used.
-        audio_token (`str`, *optional*, defaults to `"<|AUDIO|>"`):
-            The token to use for audio tokens.
-        audio_bos_token (`str`, *optional*, defaults to `"<|audio_bos|>"`):
-            The token to use for audio bos tokens.
-        audio_eos_token (`str`, *optional*, defaults to `"<|audio_eos|>"`):
-            The token to use for audio eos tokens.
-    """
-
-    attributes = ["feature_extractor", "tokenizer"]
-    feature_extractor_class = "WhisperFeatureExtractor"
-    tokenizer_class = "AutoTokenizer"
-
     def __init__(
         self,
         feature_extractor=None,
@@ -61,70 +43,58 @@ class Qwen2AudioProcessor(ProcessorMixin):
         audio_bos_token="<|audio_bos|>",
         audio_eos_token="<|audio_eos|>",
     ):
+        r"""
+        audio_token (`str`, *optional*, defaults to `"<|AUDIO|>"`):
+            The token to use for audio tokens.
+        audio_bos_token (`str`, *optional*, defaults to `"<|audio_bos|>"`):
+            The token to use for audio bos tokens.
+        audio_eos_token (`str`, *optional*, defaults to `"<|audio_eos|>"`):
+            The token to use for audio eos tokens.
+        """
         if chat_template is None:
             chat_template = self.default_chat_template
         self.audio_token = tokenizer.audio_token if hasattr(tokenizer, "audio_token") else audio_token
+        self.audio_token_id = tokenizer.convert_tokens_to_ids(self.audio_token)
         self.audio_bos_token = tokenizer.audio_bos_token if hasattr(tokenizer, "audio_bos_token") else audio_bos_token
         self.audio_eos_token = tokenizer.audio_eos_token if hasattr(tokenizer, "audio_eos_token") else audio_eos_token
         super().__init__(feature_extractor, tokenizer, chat_template=chat_template)
 
+    @auto_docstring
     def __call__(
         self,
-        text: Union[TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]] = None,
-        audios: Union[np.ndarray, List[np.ndarray]] = None,
-        padding: Union[bool, str, PaddingStrategy] = False,
-        sampling_rate: Optional[int] = None,
-        **kwargs,
+        text: TextInput | PreTokenizedInput | list[TextInput] | list[PreTokenizedInput] = None,
+        audio: np.ndarray | list[np.ndarray] = None,
+        **kwargs: Unpack[Qwen2AudioProcessorKwargs],
     ) -> BatchFeature:
-        """
-        Main method to prepare for the model one or several sequences(s) and audio(s). This method forwards the `text`
-        and `kwargs` arguments to Qwen2TokenizerFast's [`~Qwen2TokenizerFast.__call__`] if `text` is not `None` to encode
-        the text. To prepare the audio(s), this method forwards the `audios` and `kwrags` arguments to
-        WhisperFeatureExtractor's [`~WhisperFeatureExtractor.__call__`] if `audios` is not `None`. Please refer to the doctsring
-        of the above two methods for more information.
-
-        Args:
-            text (`str`, `List[str]`, `List[List[str]]`):
-                The sequence or batch of sequences to be encoded. Each sequence can be a string or a list of strings
-                (pretokenized string). If the sequences are provided as list of strings (pretokenized), you must set
-                `is_split_into_words=True` (to lift the ambiguity with a batch of sequences).
-            audios (`np.ndarray`, `List[np.ndarray]`):
-                The audio or batch of audios to be prepared. Each audio can be a NumPy array.
-            padding (`bool`, `str` or [`~utils.PaddingStrategy`], *optional*, defaults to `False`):
-                Select a strategy to pad the returned sequences (according to the model's padding side and padding
-                index) among:
-                - `True` or `'longest'`: Pad to the longest sequence in the batch (or no padding if only a single
-                  sequence if provided).
-                - `'max_length'`: Pad to a maximum length specified with the argument `max_length` or to the maximum
-                  acceptable input length for the model if that argument is not provided.
-                - `False` or `'do_not_pad'` (default): No padding (i.e., can output a batch with sequences of different
-                  lengths).
-            sampling_rate (`int`, defaults to 16000):
-                The sampling rate at which the audio files should be digitalized expressed in hertz (Hz).
-        """
-
         if text is None:
-            raise ValueError("You need to specify either a `text` input to process.")
+            raise ValueError("You need to specify `text` input to process.")
         elif isinstance(text, str):
             text = [text]
         elif not isinstance(text, list) and not isinstance(text[0], str):
             raise ValueError("Invalid input text. Please provide a string, or a list of strings")
 
-        # ensure we have as much audios as audio tokens
-        num_audio_tokens = sum(sample.count(self.audio_token) for sample in text)
-        num_audios = 1 if isinstance(audios, np.ndarray) else len(audios)
-        if num_audio_tokens != num_audios:
-            raise ValueError(
-                f"Found {num_audio_tokens} {self.audio_token} token{'s' if num_audio_tokens > 1 else ''} in provided text but received {num_audios} audio{'s' if num_audios > 1 else ''}"
-            )
+        output_kwargs = self._merge_kwargs(
+            Qwen2AudioProcessorKwargs,
+            tokenizer_init_kwargs=self.tokenizer.init_kwargs,
+            **kwargs,
+        )
 
-        if audios is not None:
-            audio_inputs = self.feature_extractor(
-                audios, sampling_rate=sampling_rate, return_attention_mask=True, padding="max_length", **kwargs
-            )
-            audio_inputs["feature_attention_mask"] = audio_inputs.pop(
-                "attention_mask"
-            )  # rename attention_mask to prevent conflicts later on
+        if audio is not None:
+            # ensure we have as much audios as audio tokens
+            num_audio_tokens = sum(sample.count(self.audio_token) for sample in text)
+            num_audios = 1 if type(audio) is np.ndarray else len(audio)
+            if num_audio_tokens != num_audios:
+                raise ValueError(
+                    f"Found {num_audio_tokens} {self.audio_token} token{'s' if num_audio_tokens > 1 else ''} in provided text but received {num_audios} audio{'s' if num_audios > 1 else ''}"
+                )
+
+            # Some kwargs should not be changed so we can expand text with audio tokens below
+            output_kwargs["audio_kwargs"]["return_attention_mask"] = True
+            output_kwargs["audio_kwargs"]["padding"] = "max_length"
+            audio_inputs = self.feature_extractor(audio, **output_kwargs["audio_kwargs"])
+
+            # rename attention_mask to prevent conflicts later on
+            audio_inputs["feature_attention_mask"] = audio_inputs.pop("attention_mask")
 
             expanded_text = []
             audio_lengths = audio_inputs["feature_attention_mask"].sum(-1).tolist()
@@ -162,26 +132,14 @@ class Qwen2AudioProcessor(ProcessorMixin):
                 expanded_text.append(sample)
             text = expanded_text
 
-        inputs = self.tokenizer(text, padding=padding, **kwargs)
+        return_tensors = output_kwargs["text_kwargs"].pop("return_tensors", None)
+        inputs = self.tokenizer(text, **output_kwargs["text_kwargs"])
+        self._check_special_mm_tokens(text, inputs, modalities=["audio"])
 
-        if audios is not None:
+        if audio is not None:
             inputs.update(audio_inputs)
 
-        return BatchFeature(data={**inputs})
-
-    def batch_decode(self, *args, **kwargs):
-        """
-        This method forwards all its arguments to Qwen2TokenizerFast's [`~PreTrainedTokenizer.batch_decode`]. Please
-        refer to the docstring of this method for more information.
-        """
-        return self.tokenizer.batch_decode(*args, **kwargs)
-
-    def decode(self, *args, **kwargs):
-        """
-        This method forwards all its arguments to Qwen2TokenizerFast's [`~PreTrainedTokenizer.decode`]. Please refer to
-        the docstring of this method for more information.
-        """
-        return self.tokenizer.decode(*args, **kwargs)
+        return BatchFeature(data={**inputs}, tensor_type=return_tensors)
 
     @property
     def model_input_names(self):
@@ -190,6 +148,7 @@ class Qwen2AudioProcessor(ProcessorMixin):
         return list(dict.fromkeys(tokenizer_input_names + feature_extractor_input_names + ["feature_attention_mask"]))
 
     @property
+    # NOTE: we don't have default templates anymore, and the below is kept only because the hub config is not yet updated!
     def default_chat_template(self):
         """
         This default vicuna template formats inputs in the form of a chat history. For each message in the chat history:
@@ -228,7 +187,7 @@ class Qwen2AudioProcessor(ProcessorMixin):
                     "{{ message['content'] }}<|im_end|>\n"
                 "{% else %}"
                     "{% for content in message['content'] %}"
-                        "{% if 'audio' in content or 'audio_url' in content %}"
+                        "{% if 'audio' in content or 'audio_url' in content or message['type'] == 'audio' or content['type'] == 'audio' %}"
                             "{% set audio_count.value = audio_count.value + 1 %}"
                             "Audio {{ audio_count.value }}: <|audio_bos|><|AUDIO|><|audio_eos|>\n"
                         "{% elif 'text' in content %}"

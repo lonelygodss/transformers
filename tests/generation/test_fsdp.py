@@ -13,14 +13,20 @@
 # limitations under the License.
 
 import argparse
-from typing import Any, Callable
+import textwrap
+from collections.abc import Callable
+from typing import Any
 
 from transformers import is_torch_available
 from transformers.testing_utils import (
     TestCasePlus,
+    backend_device_count,
+    backend_torch_accelerator_module,
     execute_subprocess_async,
     get_torch_dist_unique_port,
-    require_torch_multi_gpu,
+    require_torch_multi_accelerator,
+    torch_device,
+    torchrun,
 )
 
 
@@ -46,7 +52,8 @@ if is_torch_available():
         """Manage the creation and destruction of the distributed process group for the wrapped function."""
 
         def wrapped(*args: Any, **kwargs: Any) -> Any:
-            torch.distributed.init_process_group(world_size=torch.cuda.device_count())
+            device_count = backend_device_count(torch_device)
+            torch.distributed.init_process_group(world_size=device_count)
             try:
                 return func(*args, **kwargs)
             finally:
@@ -56,7 +63,8 @@ if is_torch_available():
 
     @manage_process_group
     def fsdp_generate():
-        torch.cuda.set_device(device := torch.device(rank := torch.distributed.get_rank()))
+        torch_accelerator_module = backend_torch_accelerator_module(torch_device)
+        torch_accelerator_module.set_device(device := torch.device(rank := torch.distributed.get_rank()))
 
         model = AutoModelForCausalLM.from_pretrained("hf-internal-testing/tiny-random-gpt2").to(device)
 
@@ -79,11 +87,12 @@ if is_torch_available():
 
     @manage_process_group
     def fsdp2_generate():
-        torch.cuda.set_device(device := torch.device(rank := torch.distributed.get_rank()))
+        torch_accelerator_module = backend_torch_accelerator_module(torch_device)
+        torch_accelerator_module.set_device(device := torch.device(rank := torch.distributed.get_rank()))
 
         model = AutoModelForCausalLM.from_pretrained("hf-internal-testing/tiny-random-gpt2").to(device)
 
-        mesh = init_device_mesh("cuda", (torch.distributed.get_world_size(),))
+        mesh = init_device_mesh(device.type, (torch.distributed.get_world_size(),))
         for submodule in model.modules():
             if isinstance(submodule, GPT2Block):
                 fully_shard(submodule, mesh=mesh)
@@ -102,27 +111,67 @@ if is_torch_available():
 
 
 class TestFSDPGeneration(TestCasePlus):
-    @require_torch_multi_gpu
+    @require_torch_multi_accelerator
     def test_fsdp_generate(self):
-        distributed_args = f"""--nproc_per_node={torch.cuda.device_count()}
+        device_count = backend_device_count(torch_device)
+        distributed_args = f"""--nproc_per_node={device_count}
             --master_port={get_torch_dist_unique_port()}
             {self.test_file_dir}/test_fsdp.py
         """.split()
-        args = "--fsdp".split()
+        args = ["--fsdp"]
         cmd = ["torchrun"] + distributed_args + args
         execute_subprocess_async(cmd, env=self.get_env())
         # successful return here == success - any errors would have caused an error in the sub-call
 
-    @require_torch_multi_gpu
+    @require_torch_multi_accelerator
     def test_fsdp2_generate(self):
-        distributed_args = f"""--nproc_per_node={torch.cuda.device_count()}
+        device_count = backend_device_count(torch_device)
+
+        distributed_args = f"""--nproc_per_node={device_count}
             --master_port={get_torch_dist_unique_port()}
             {self.test_file_dir}/test_fsdp.py
         """.split()
-        args = "--fsdp2".split()
+        args = ["--fsdp2"]
         cmd = ["torchrun"] + distributed_args + args
         execute_subprocess_async(cmd, env=self.get_env())
         # successful return here == success - any errors would have caused an error in the sub-call
+
+
+class TestFSDPGenericTaskModel(TestCasePlus):
+    nproc_per_node = 2
+
+    def test_generic_task_model_can_be_sharded(self):
+        script_to_run = textwrap.dedent(
+            """
+            import torch
+            from torch.distributed.fsdp import fully_shard
+            from transformers import AutoModelForTokenClassification
+
+            current_accelerator = torch.accelerator.current_accelerator(check_available=True)
+            accelerator_type = "cpu" if current_accelerator is None else current_accelerator.type
+            torch_accelerator_module = getattr(torch, accelerator_type, torch.cuda)
+
+            backend = "gloo"
+            if accelerator_type == "cuda":
+                backend = "nccl"
+            elif accelerator_type == "xpu":
+                backend = "xccl"
+
+            torch.distributed.init_process_group(
+                backend=backend, init_method="env://"
+            )
+            rank = torch.distributed.get_rank()
+            if torch_accelerator_module.is_available():
+                torch_accelerator_module.set_device(rank)
+
+            # Make sure it works
+            model = AutoModelForTokenClassification.from_pretrained("Qwen/Qwen2-0.5B")
+            module = fully_shard(model)
+
+            torch.distributed.destroy_process_group()
+            """
+        )
+        torchrun(script_to_run, self.nproc_per_node, env=self.get_env())
 
 
 if __name__ == "__main__":

@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2020 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -526,5 +525,6 @@ class XLMModelLanguageGenerationTest(unittest.TestCase):
             447,
         ]  # the president the president the president the president the president the president the president the president the president the president
         # TODO(PVP): this and other input_ids I tried for generation give pretty bad results. Not sure why. Model might just not be made for auto-regressive inference
-        output_ids = model.generate(input_ids, do_sample=False)
-        self.assertListEqual(output_ids[0].cpu().numpy().tolist(), expected_output_ids)
+        # We limit the generation output to (max_length - input_length) while by default 20 new tokens will be generated.
+        output_ids = model.generate(input_ids, do_sample=False, max_length=20)
+        self.assertListEqual(output_ids[0].tolist(), expected_output_ids)
