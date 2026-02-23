@@ -17,6 +17,9 @@ from collections.abc import Callable
 
 import torch
 
+# need a highly editable version of mxfp8, so we use nn to implement instead of blackbox import
+import torch.nn as nn
+
 from ...cache_utils import Cache
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...modeling_outputs import CausalLMOutputWithPast
@@ -44,13 +47,50 @@ logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "Qwen/Qwen3-8B"
 
+# Create a new class to replace nn.Linear which simulate mxfp8 and expose bit-level computation.
+class MXFP8Linear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, config = None):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.bias = bias
+        self.block_size = config.mxfp8_block_size if config else 32
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        if bias:
+            self.bias_param = nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter("bias_param", None)
+
+    def forward(self, x, compute_context=None):
+       # 1. Extract shared scales
+       # 2. Quantize x and self.weight to simulate mxfp8 quantization
+
+       # 3. Placeholder for future MSB-first bit-serial computation implementation
+
+       # Fallback for step 1 (standard matmul on simulated quantized weights)
+       out = torch.matmul(x, self.weight.t())
+       if self.bias_param is not None:
+           out += self.bias_param
+       return out
 
 class Qwen3RMSNorm(Qwen2RMSNorm):
     pass
 
+# 
+class Qwen3MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
 
-class Qwen3MLP(GemmaMLP):
-    pass
+    def forward(self, x):
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
 
 
 class Qwen3RotaryEmbedding(Qwen2RotaryEmbedding):
