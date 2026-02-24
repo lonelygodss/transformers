@@ -42,6 +42,8 @@ from ..qwen2.modeling_qwen2 import (
 )
 from .configuration_qwen3 import Qwen3Config
 
+from ...activations import ACT2FN
+
 
 logger = logging.get_logger(__name__)
 
