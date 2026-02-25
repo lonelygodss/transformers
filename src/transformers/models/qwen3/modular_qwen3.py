@@ -15,10 +15,17 @@
 
 from collections.abc import Callable
 
+import math
+
 import torch
 
 # need a highly editable version of mxfp8, so we use nn to implement instead of blackbox import
 import torch.nn as nn
+import torch.nn.functional as F
+
+# FP8 E4M3FN: max representable magnitude
+_FP8_E4M3_MAX = 448.0
+_HAS_FP8 = hasattr(torch, "float8_e4m3fn")
 
 from ...cache_utils import Cache
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
@@ -49,45 +56,144 @@ logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "Qwen/Qwen3-8B"
 
-# Create a new class to replace nn.Linear which simulate mxfp8 and expose bit-level computation.
+# Create a new class to replace nn.Linear which simulates mxfp8 and exposes bit-level computation.
 class MXFP8Linear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, bias: bool = True, config = None):
+    """
+    Drop-in replacement for nn.Linear that simulates MX FP8 (OCP MX spec) computation:
+      - Each contiguous block of `block_size` elements along the in_features dimension
+        shares a single fp32 scale (derived from the block max-abs).
+      - Elements within each block are quantized to FP8 E4M3FN.
+      - The matmul is computed block-wise:
+            out = sum_b  scale_x[b] * scale_w[b]  *  dot(x_fp8[b], w_fp8[b])
+        so the shared scales and element values are kept separate throughout.
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, config=None):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.bias = bias
         self.block_size = config.mxfp8_block_size if config else 32
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         if bias:
             self.bias_param = nn.Parameter(torch.empty(out_features))
         else:
             self.register_parameter("bias_param", None)
+        if not _HAS_FP8:
+            raise RuntimeError("MXFP8Linear requires PyTorch >= 2.1 with float8_e4m3fn support.")
 
-    def forward(self, x, compute_context=None):
-       # 1. Extract shared scales
-       # 2. Quantize x and self.weight to simulate mxfp8 quantization
+    @staticmethod
+    def _quantize_fp8(
+        x_blocks: torch.Tensor, eps: float = 1e-30
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Quantize a block-partitioned tensor to FP8 E4M3FN.
 
-       # 3. Placeholder for future MSB-first bit-serial computation implementation
+        Args:
+            x_blocks: float32 tensor of shape (..., num_blocks, block_size)
+            eps: minimum scale to avoid division by zero
 
-       # Fallback for step 1 (standard matmul on simulated quantized weights)
-       out = torch.matmul(x, self.weight.t())
-       if self.bias_param is not None:
-           out += self.bias_param
-       return out
+        Returns:
+            x_fp8:  same shape as x_blocks, float32 values rounded to fp8 precision
+            scales: float32 tensor of shape (..., num_blocks) — one shared scale per block
+        """
+        # 1. Compute per-block max-abs -> fp32 shared scale
+        max_abs = x_blocks.abs().amax(dim=-1)  # (..., num_blocks)
+        scales = torch.clamp(max_abs / _FP8_E4M3_MAX, min=eps)  # fp32 scale
+
+        # 2. Normalise into fp8 representable range, then cast to fp8 and back
+        x_scaled = x_blocks / scales.unsqueeze(-1)  # (..., num_blocks, block_size)
+        x_fp8 = x_scaled.to(torch.float8_e4m3fn).float()  # simulate fp8 rounding
+
+        return x_fp8, scales
+
+    def _prepare_blocks(
+        self, tensor: torch.Tensor, rows: int
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """
+        Pad tensor's last dimension to a multiple of block_size, reshape into blocks,
+        and return (fp8_blocks, scales, pad_len).
+
+            tensor: (rows, in_like)   — must be contiguous float32
+            returns fp8: (rows, num_blocks, block_size)
+                    scales: (rows, num_blocks)        fp32
+        """
+        feat = tensor.shape[-1]
+        pad_len = (-feat) % self.block_size
+        if pad_len:
+            tensor = F.pad(tensor, (0, pad_len))
+        num_blocks = tensor.shape[-1] // self.block_size
+        blocks = tensor.view(rows, num_blocks, self.block_size)
+        fp8, scales = self._quantize_fp8(blocks)
+        return fp8, scales, pad_len
+
+    def forward(self, x: torch.Tensor, compute_context=None) -> torch.Tensor:
+        """
+        MX FP8 forward pass.
+
+        For each block b along in_features:
+            out[n, j] += scale_x[n, b] * scale_w[j, b] * dot(x_fp8[n, b, :], w_fp8[j, b, :])
+
+        Scales are fp32; element products are performed in fp8-simulated float32.
+        """
+        orig_dtype = x.dtype
+        batch_shape = x.shape[:-1]
+        N = math.prod(batch_shape) if batch_shape else 1
+
+        x_2d = x.float().reshape(N, self.in_features)    # (N, in_features)
+        w_2d = self.weight.float()                        # (out_features, in_features)
+
+        # Quantise: fp8 elements + fp32 shared scales, one scale per block
+        x_fp8, x_scales, _ = self._prepare_blocks(x_2d, N)               # (N,   nb, bs), (N,   nb)
+        w_fp8, w_scales, _ = self._prepare_blocks(w_2d, self.out_features) # (out, nb, bs), (out, nb)
+
+        num_blocks = x_fp8.shape[1]
+
+        # Block-wise accumulation:
+        #   elem_dot  = x_fp8[:, b, :] @ w_fp8[:, b, :].T   shape (N, out)
+        #   blk_scale = x_scales[:, b].unsqueeze(1)          shape (N, 1)
+        #             * w_scales[:, b].unsqueeze(0)           shape (1, out)
+        # -> out += blk_scale * elem_dot
+        #
+        # Use batched matmul to avoid a Python loop overhead:
+        #   x_fp8: (N, nb, bs) -> permute -> (nb, N, bs)
+        #   w_fp8: (out, nb, bs) -> permute -> (nb, bs, out)
+        #   bmm   -> (nb, N, out)
+        elem_dots = torch.bmm(
+            x_fp8.permute(1, 0, 2),            # (nb, N, bs)
+            w_fp8.permute(1, 2, 0),            # (nb, bs, out)
+        )                                       # (nb, N, out)
+
+        # Combined fp32 scales: (nb, N, 1) * (nb, 1, out) -> (nb, N, out)
+        combined_scales = x_scales.t().unsqueeze(-1) * w_scales.t().unsqueeze(1)
+
+        # 2. Placeholder for future MSB-first bit-serial computation implementation
+
+        # Weighted sum over blocks -> (N, out)
+        result = (elem_dots * combined_scales).sum(dim=0)
+
+        if self.bias_param is not None:
+            result = result + self.bias_param
+
+        return result.view(*batch_shape, self.out_features).to(orig_dtype)
 
 class Qwen3RMSNorm(Qwen2RMSNorm):
     pass
 
-# 
+# explicitly define MLP to implement mxfp8 quantization and future MSB-first bit-serial computation, instead of using GemmaMLP which is a blackbox import
 class Qwen3MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        if config.use_mxfp8:
+            self.gate_proj = MXFP8Linear(self.hidden_size, self.intermediate_size, bias=False, config=config)
+            self.up_proj = MXFP8Linear(self.hidden_size, self.intermediate_size, bias=False, config=config)
+            self.down_proj = MXFP8Linear(self.intermediate_size, self.hidden_size, bias=False, config=config)
+        else:
+            self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+            self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+            self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
