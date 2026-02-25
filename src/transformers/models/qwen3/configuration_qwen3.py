@@ -147,9 +147,15 @@ class Qwen3Config(PreTrainedConfig):
         pad_token_id: int | None = None,
         bos_token_id: int | None = None,
         eos_token_id: int | None = None,
-        # add mxfp8 for inference
+        # MX low-precision formats for MLP inference
+        # At most one of use_mxfp8 / use_mxfp6 / use_mxfp4 should be True.
         use_mxfp8: bool | None = False,
         mxfp8_block_size: int | None = 32,
+        use_mxfp6: bool | None = False,
+        mxfp6_block_size: int | None = 32,
+        mxfp6_format: str | None = "e2m3",   # "e2m3" (max=7.5) or "e3m2" (max=28.0)
+        use_mxfp4: bool | None = False,
+        mxfp4_block_size: int | None = 32,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -192,6 +198,11 @@ class Qwen3Config(PreTrainedConfig):
         self.rope_parameters = rope_parameters
         self.use_mxfp8 = use_mxfp8
         self.mxfp8_block_size = mxfp8_block_size
+        self.use_mxfp6 = use_mxfp6
+        self.mxfp6_block_size = mxfp6_block_size
+        self.mxfp6_format = mxfp6_format
+        self.use_mxfp4 = use_mxfp4
+        self.mxfp4_block_size = mxfp4_block_size
 
         super().__init__(**kwargs)
 

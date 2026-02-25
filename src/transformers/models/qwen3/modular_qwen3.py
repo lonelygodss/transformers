@@ -23,9 +23,90 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# FP8 E4M3FN: max representable magnitude
-_FP8_E4M3_MAX = 448.0
+# Per-format max representable magnitude (OCP MX spec)
+_FP8_E4M3_MAX  = 448.0   # FP8  E4M3FN
+_FP4_E2M1_MAX  =   6.0   # FP4  E2M1
+_FP6_E2M3_MAX  =   7.5   # FP6  E2M3
+_FP6_E3M2_MAX  =  28.0   # FP6  E3M2
+
 _HAS_FP8 = hasattr(torch, "float8_e4m3fn")
+
+
+# ── OCP-spec representable-value grids ───────────────────────────────────────
+
+def _build_fp4_e2m1_grid() -> list[float]:
+    """All 16 FP4 E2M1 values (OCP MX spec, bias=1, no ±inf, no NaN)."""
+    vals: set[float] = set()
+    for bits in range(16):          # 4 bits
+        s = (bits >> 3) & 1
+        e = (bits >> 1) & 0b11
+        m = bits & 1
+        if e == 0:                  # subnormal: 0.m × 2^(1-bias)=2^0
+            v = m * 0.5
+        else:                       # normal: (1+m×0.5) × 2^(e-bias)
+            v = (1.0 + m * 0.5) * (2.0 ** (e - 1))
+        vals.add(-v if s else v)
+    return sorted(vals)
+
+
+def _build_fp6_e2m3_grid() -> list[float]:
+    """All 64 FP6 E2M3 values (OCP MX spec, bias=1, no ±inf, no NaN)."""
+    vals: set[float] = set()
+    for bits in range(64):          # 6 bits
+        s = (bits >> 5) & 1
+        e = (bits >> 3) & 0b11
+        m = bits & 0b111
+        if e == 0:                  # subnormal: 0.mantissa × 2^(1-1)
+            v = m / 8.0
+        else:                       # normal: (1+m/8) × 2^(e-1)
+            v = (1.0 + m / 8.0) * (2.0 ** (e - 1))
+        vals.add(-v if s else v)
+    return sorted(vals)
+
+
+def _build_fp6_e3m2_grid() -> list[float]:
+    """All 64 FP6 E3M2 values (OCP MX spec, bias=3, no ±inf, no NaN).
+
+    Bit layout: [s | e2 e1 e0 | m1 m0]  (bit-5 = sign, bits 4-2 = exp, bits 1-0 = mant)
+    """
+    vals: set[float] = set()
+    for bits in range(64):          # 6 bits
+        s = (bits >> 5) & 1
+        e = (bits >> 2) & 0b111    # 3-bit exponent (bits 4:2)
+        m = bits & 0b11             # 2-bit mantissa  (bits 1:0)
+        if e == 0:                  # subnormal: 0.mm × 2^(1-3)=2^(-2)
+            v = (m / 4.0) * 0.25
+        else:                       # normal: (1+m/4) × 2^(e-3)
+            v = (1.0 + m / 4.0) * (2.0 ** (e - 3))
+        vals.add(-v if s else v)
+    return sorted(vals)
+
+
+# Precomputed Python lists (converted to tensors per-device lazily)
+# NOTE: must be plain Assign (not AnnAssign) — the modular converter only tracks plain assignments
+_FP4_E2M1_GRID_LIST = _build_fp4_e2m1_grid()
+_FP6_E2M3_GRID_LIST = _build_fp6_e2m3_grid()
+_FP6_E3M2_GRID_LIST = _build_fp6_e3m2_grid()
+
+
+def _get_grid(grid_list: list[float], device: torch.device) -> torch.Tensor:
+    """Return a sorted float32 tensor of representable values on the target device."""
+    return torch.tensor(grid_list, dtype=torch.float32, device=device)
+
+
+def _nearest_on_grid(x: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
+    """
+    Round each element of x to the nearest value in sorted 1-D `grid`.
+    Both x and grid must be float32 and on the same device.
+    """
+    # searchsorted returns the index at which x would be inserted to keep grid sorted
+    idx = torch.searchsorted(grid.contiguous(), x.contiguous())
+    idx = idx.clamp(0, len(grid) - 1)
+    idx_lo = (idx - 1).clamp(0)
+    v_hi = grid[idx]
+    v_lo = grid[idx_lo]
+    # Select whichever representable value is closer
+    return torch.where((x - v_lo).abs() <= (x - v_hi).abs(), v_lo, v_hi)
 
 from ...cache_utils import Cache
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
@@ -56,66 +137,74 @@ logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "Qwen/Qwen3-8B"
 
-# Create a new class to replace nn.Linear which simulates mxfp8 and exposes bit-level computation.
-class MXFP8Linear(nn.Module):
+# ── Shared base class ────────────────────────────────────────────────────────
+
+class _MXFPLinearBase(nn.Module):
     """
-    Drop-in replacement for nn.Linear that simulates MX FP8 (OCP MX spec) computation:
-      - Each contiguous block of `block_size` elements along the in_features dimension
-        shares a single fp32 scale (derived from the block max-abs).
-      - Elements within each block are quantized to FP8 E4M3FN.
-      - The matmul is computed block-wise:
-            out = sum_b  scale_x[b] * scale_w[b]  *  dot(x_fp8[b], w_fp8[b])
-        so the shared scales and element values are kept separate throughout.
+    Base class for MX-format linear layers (OCP MX spec).
+
+    Block-wise forward pass (common to all formats):
+        out[n, j] = sum_b  scale_x[n,b] * scale_w[j,b] * dot(x_q[n,b,:], w_q[j,b,:])
+
+    Subclasses implement `FORMAT_MAX` and `_quantize_elements`, which converts
+    a float32 tensor of values normalised into [-FORMAT_MAX, FORMAT_MAX] to the
+    target low-precision format (returned as float32).
     """
+
+    FORMAT_MAX: float = 1.0  # override in subclasses
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True, config=None):
         super().__init__()
-        self.in_features = in_features
+        self.in_features  = in_features
         self.out_features = out_features
-        self.block_size = config.mxfp8_block_size if config else 32
+        self.block_size   = self._get_block_size(config)
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         if bias:
             self.bias_param = nn.Parameter(torch.empty(out_features))
         else:
             self.register_parameter("bias_param", None)
-        if not _HAS_FP8:
-            raise RuntimeError("MXFP8Linear requires PyTorch >= 2.1 with float8_e4m3fn support.")
 
-    @staticmethod
-    def _quantize_fp8(
-        x_blocks: torch.Tensor, eps: float = 1e-30
+    def _get_block_size(self, config) -> int:
+        """Resolved by subclasses; fall back to 32."""
+        return 32
+
+    def _quantize_elements(self, x_normalized: torch.Tensor) -> torch.Tensor:
+        """
+        Quantize float32 values already normalised into [-FORMAT_MAX, FORMAT_MAX]
+        to the target low-precision format.  Return float32.
+        """
+        raise NotImplementedError
+
+    def _quantize_to_blocks(
+        self, x_blocks: torch.Tensor, eps: float = 1e-30
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Quantize a block-partitioned tensor to FP8 E4M3FN.
+        Compute per-block fp32 shared scales and quantize elements.
 
         Args:
-            x_blocks: float32 tensor of shape (..., num_blocks, block_size)
-            eps: minimum scale to avoid division by zero
-
+            x_blocks: float32  (..., num_blocks, block_size)
         Returns:
-            x_fp8:  same shape as x_blocks, float32 values rounded to fp8 precision
-            scales: float32 tensor of shape (..., num_blocks) — one shared scale per block
+            x_q:    same shape, float32 values rounded to low-precision format
+            scales: (..., num_blocks) fp32 shared scales
         """
-        # 1. Compute per-block max-abs -> fp32 shared scale
-        max_abs = x_blocks.abs().amax(dim=-1)  # (..., num_blocks)
-        scales = torch.clamp(max_abs / _FP8_E4M3_MAX, min=eps)  # fp32 scale
-
-        # 2. Normalise into fp8 representable range, then cast to fp8 and back
-        x_scaled = x_blocks / scales.unsqueeze(-1)  # (..., num_blocks, block_size)
-        x_fp8 = x_scaled.to(torch.float8_e4m3fn).float()  # simulate fp8 rounding
-
-        return x_fp8, scales
+        # 1. fp32 shared scale = max_abs / FORMAT_MAX  (one per block)
+        max_abs = x_blocks.abs().amax(dim=-1)                            # (..., nb)
+        scales  = torch.clamp(max_abs / self.FORMAT_MAX, min=eps)        # fp32 scale
+        # 2. Normalise, quantize elements, return
+        x_normalized = x_blocks / scales.unsqueeze(-1)                   # (..., nb, bs)
+        x_q = self._quantize_elements(x_normalized)                      # (..., nb, bs)
+        return x_q, scales
 
     def _prepare_blocks(
         self, tensor: torch.Tensor, rows: int
     ) -> tuple[torch.Tensor, torch.Tensor, int]:
         """
-        Pad tensor's last dimension to a multiple of block_size, reshape into blocks,
-        and return (fp8_blocks, scales, pad_len).
-
-            tensor: (rows, in_like)   — must be contiguous float32
-            returns fp8: (rows, num_blocks, block_size)
-                    scales: (rows, num_blocks)        fp32
+        Pad `tensor` to a multiple of block_size in the last dimension,
+        reshape into blocks, and quantize.
+            tensor : (rows, in_like)  float32
+            returns: q_blocks  (rows, num_blocks, block_size)  float32
+                     scales    (rows, num_blocks)               fp32
+                     pad_len   int
         """
         feat = tensor.shape[-1]
         pad_len = (-feat) % self.block_size
@@ -123,77 +212,167 @@ class MXFP8Linear(nn.Module):
             tensor = F.pad(tensor, (0, pad_len))
         num_blocks = tensor.shape[-1] // self.block_size
         blocks = tensor.view(rows, num_blocks, self.block_size)
-        fp8, scales = self._quantize_fp8(blocks)
-        return fp8, scales, pad_len
+        q, scales = self._quantize_to_blocks(blocks)
+        return q, scales, pad_len
 
     def forward(self, x: torch.Tensor, compute_context=None) -> torch.Tensor:
         """
-        MX FP8 forward pass.
+        MX-format block-wise forward pass.
 
         For each block b along in_features:
-            out[n, j] += scale_x[n, b] * scale_w[j, b] * dot(x_fp8[n, b, :], w_fp8[j, b, :])
+            out[n, j] += scale_x[n, b] * scale_w[j, b] * dot(x_q[n, b, :], w_q[j, b, :])
 
-        Scales are fp32; element products are performed in fp8-simulated float32.
+        Scales are fp32; element dot-products use low-precision-simulated float32.
         """
-        orig_dtype = x.dtype
+        orig_dtype  = x.dtype
         batch_shape = x.shape[:-1]
         N = math.prod(batch_shape) if batch_shape else 1
 
-        x_2d = x.float().reshape(N, self.in_features)    # (N, in_features)
-        w_2d = self.weight.float()                        # (out_features, in_features)
+        x_2d = x.float().reshape(N, self.in_features)   # (N, in)
+        w_2d = self.weight.float()                       # (out, in)
 
-        # Quantise: fp8 elements + fp32 shared scales, one scale per block
-        x_fp8, x_scales, _ = self._prepare_blocks(x_2d, N)               # (N,   nb, bs), (N,   nb)
-        w_fp8, w_scales, _ = self._prepare_blocks(w_2d, self.out_features) # (out, nb, bs), (out, nb)
+        x_q, x_scales, _ = self._prepare_blocks(x_2d, N)                # (N,   nb, bs), (N,   nb)
+        w_q, w_scales, _ = self._prepare_blocks(w_2d, self.out_features) # (out, nb, bs), (out, nb)
 
-        num_blocks = x_fp8.shape[1]
-
-        # Block-wise accumulation:
-        #   elem_dot  = x_fp8[:, b, :] @ w_fp8[:, b, :].T   shape (N, out)
-        #   blk_scale = x_scales[:, b].unsqueeze(1)          shape (N, 1)
-        #             * w_scales[:, b].unsqueeze(0)           shape (1, out)
-        # -> out += blk_scale * elem_dot
-        #
-        # Use batched matmul to avoid a Python loop overhead:
-        #   x_fp8: (N, nb, bs) -> permute -> (nb, N, bs)
-        #   w_fp8: (out, nb, bs) -> permute -> (nb, bs, out)
-        #   bmm   -> (nb, N, out)
+        # Batched block-wise matmul:
+        #   x_q: (N,   nb, bs) -> (nb, N,  bs)
+        #   w_q: (out, nb, bs) -> (nb, bs, out)
+        #   bmm -> (nb, N, out)
         elem_dots = torch.bmm(
-            x_fp8.permute(1, 0, 2),            # (nb, N, bs)
-            w_fp8.permute(1, 2, 0),            # (nb, bs, out)
-        )                                       # (nb, N, out)
+            x_q.permute(1, 0, 2),   # (nb, N,  bs)
+            w_q.permute(1, 2, 0),   # (nb, bs, out)
+        )                           # (nb, N, out)
 
-        # Combined fp32 scales: (nb, N, 1) * (nb, 1, out) -> (nb, N, out)
+        # Combined fp32 scale product: (nb, N, 1) * (nb, 1, out) -> (nb, N, out)
         combined_scales = x_scales.t().unsqueeze(-1) * w_scales.t().unsqueeze(1)
 
-        # 2. Placeholder for future MSB-first bit-serial computation implementation
+        # Placeholder for future MSB-first bit-serial computation implementation
 
-        # Weighted sum over blocks -> (N, out)
-        result = (elem_dots * combined_scales).sum(dim=0)
+        result = (elem_dots * combined_scales).sum(dim=0)  # (N, out)
 
         if self.bias_param is not None:
             result = result + self.bias_param
 
         return result.view(*batch_shape, self.out_features).to(orig_dtype)
 
+
+# ── Format-specific subclasses ────────────────────────────────────────────────
+
+class MXFP8Linear(_MXFPLinearBase):
+    """
+    MX FP8 linear layer (FP8 E4M3FN, OCP MX spec).
+    Uses native torch.float8_e4m3fn for element quantization.
+    """
+
+    FORMAT_MAX = _FP8_E4M3_MAX  # 448.0
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, config=None):
+        if not _HAS_FP8:
+            raise RuntimeError("MXFP8Linear requires PyTorch >= 2.1 with float8_e4m3fn support.")
+        super().__init__(in_features, out_features, bias, config)
+
+    def _get_block_size(self, config) -> int:
+        return config.mxfp8_block_size if config else 32
+
+
+
+    def _quantize_elements(self, x_normalized: torch.Tensor) -> torch.Tensor:
+        # Native fp8 cast performs the rounding; cast back to float32 for arithmetic
+        return x_normalized.to(torch.float8_e4m3fn).float()
+
+
+class MXFP4Linear(_MXFPLinearBase):
+    """
+    MX FP4 linear layer (FP4 E2M1, OCP MX spec).
+
+    All 16 FP4 E2M1 representable values (bias=1, no ±inf/NaN):
+        positive: 0, 0.5, 1, 1.5, 2, 3, 4, 6
+        max = 6.0
+
+    Element quantization via nearest-neighbor lookup on the representable grid.
+    """
+
+    FORMAT_MAX = _FP4_E2M1_MAX  # 6.0
+
+    def _get_block_size(self, config) -> int:
+        return config.mxfp4_block_size if config else 32
+
+    def _quantize_elements(self, x_normalized: torch.Tensor) -> torch.Tensor:
+        grid = _get_grid(_FP4_E2M1_GRID_LIST, x_normalized.device)
+        flat = x_normalized.reshape(-1)
+        return _nearest_on_grid(flat, grid).view(x_normalized.shape)
+
+
+class MXFP6Linear(_MXFPLinearBase):
+    """
+    MX FP6 linear layer, supporting two OCP MX FP6 variants:
+
+    * ``"e2m3"``  (default)  1-sign + 2-exp + 3-mant, bias=1, max=7.5
+    * ``"e3m2"``             1-sign + 3-exp + 2-mant, bias=3, max=28.0
+
+    Element quantization via nearest-neighbor lookup on the representable grid.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        config=None,
+        fp6_format: str = "e2m3",
+    ):
+        self.fp6_format = (getattr(config, "mxfp6_format", None) or fp6_format).lower()
+        if self.fp6_format not in ("e2m3", "e3m2"):
+            raise ValueError(f"fp6_format must be 'e2m3' or 'e3m2', got '{self.fp6_format}'")
+        super().__init__(in_features, out_features, bias, config)
+
+    @property
+    def FORMAT_MAX(self) -> float:  # type: ignore[override]
+        return _FP6_E2M3_MAX if self.fp6_format == "e2m3" else _FP6_E3M2_MAX
+
+    def _get_block_size(self, config) -> int:
+        return config.mxfp6_block_size if config else 32
+
+    def _quantize_elements(self, x_normalized: torch.Tensor) -> torch.Tensor:
+        grid_list = _FP6_E2M3_GRID_LIST if self.fp6_format == "e2m3" else _FP6_E3M2_GRID_LIST
+        grid = _get_grid(grid_list, x_normalized.device)
+        flat = x_normalized.reshape(-1)
+        return _nearest_on_grid(flat, grid).view(x_normalized.shape)
+
 class Qwen3RMSNorm(Qwen2RMSNorm):
     pass
 
-# explicitly define MLP to implement mxfp8 quantization and future MSB-first bit-serial computation, instead of using GemmaMLP which is a blackbox import
+# Mapping from config flag to linear class (evaluated lazily so subclasses are always defined)
+_MXFP_LINEAR_REGISTRY = {
+    "use_mxfp8": MXFP8Linear,
+    "use_mxfp4": MXFP4Linear,
+    "use_mxfp6": MXFP6Linear,
+}
+
+
+def _make_linear(in_f: int, out_f: int, config) -> nn.Module:
+    """
+    Return the appropriate linear layer class based on config flags.
+    Priority: mxfp8 > mxfp6 > mxfp4 > standard.
+    At most one format flag should be True; the first truthy one wins.
+    """
+    for flag, cls in _MXFP_LINEAR_REGISTRY.items():
+        if getattr(config, flag, False):
+            return cls(in_f, out_f, bias=False, config=config)
+    return nn.Linear(in_f, out_f, bias=False)
+
+
+# explicitly define MLP to implement mxfp quantization and future MSB-first bit-serial
+# computation, instead of using GemmaMLP which is a blackbox import
 class Qwen3MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        if config.use_mxfp8:
-            self.gate_proj = MXFP8Linear(self.hidden_size, self.intermediate_size, bias=False, config=config)
-            self.up_proj = MXFP8Linear(self.hidden_size, self.intermediate_size, bias=False, config=config)
-            self.down_proj = MXFP8Linear(self.intermediate_size, self.hidden_size, bias=False, config=config)
-        else:
-            self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-            self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-            self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.gate_proj = _make_linear(self.hidden_size, self.intermediate_size, config)
+        self.up_proj   = _make_linear(self.hidden_size, self.intermediate_size, config)
+        self.down_proj = _make_linear(self.intermediate_size, self.hidden_size, config)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
