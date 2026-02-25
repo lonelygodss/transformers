@@ -44,11 +44,13 @@ from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
-from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
+from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
 from ...utils.generic import maybe_autocast, merge_with_config_defaults
 from ...utils.output_capturing import capture_outputs
 from .configuration_qwen3 import Qwen3Config
 
+
+logger = logging.get_logger(__name__)
 
 # FP8 E4M3FN: max representable magnitude
 _FP8_E4M3_MAX = 448.0
@@ -195,11 +197,23 @@ class Qwen3RMSNorm(nn.Module):
 
 # explicitly define MLP to implement mxfp8 quantization and future MSB-first bit-serial computation, instead of using GemmaMLP which is a blackbox import
 class Qwen3MLP(nn.Module):
+    _mxfp8_logged: bool = False  # class-level flag: log status only once across all layers
+
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
+        if not Qwen3MLP._mxfp8_logged:
+            if config.use_mxfp8:
+                logger.info(
+                    f"Qwen3MLP: MX FP8 quantization ENABLED "
+                    f"(block_size={config.mxfp8_block_size}, format=E4M3FN, max={_FP8_E4M3_MAX})"
+                )
+            else:
+                logger.info("Qwen3MLP: MX FP8 quantization DISABLED (using standard fp32 nn.Linear)")
+            Qwen3MLP._mxfp8_logged = True
+
         if config.use_mxfp8:
             self.gate_proj = MXFP8Linear(self.hidden_size, self.intermediate_size, bias=False, config=config)
             self.up_proj = MXFP8Linear(self.hidden_size, self.intermediate_size, bias=False, config=config)

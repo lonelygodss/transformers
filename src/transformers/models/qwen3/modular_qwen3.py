@@ -181,11 +181,23 @@ class Qwen3RMSNorm(Qwen2RMSNorm):
 
 # explicitly define MLP to implement mxfp8 quantization and future MSB-first bit-serial computation, instead of using GemmaMLP which is a blackbox import
 class Qwen3MLP(nn.Module):
+    _mxfp8_logged: bool = False  # class-level flag: log status only once across all layers
+
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
+        if not Qwen3MLP._mxfp8_logged:
+            if config.use_mxfp8:
+                logger.info(
+                    f"Qwen3MLP: MX FP8 quantization ENABLED "
+                    f"(block_size={config.mxfp8_block_size}, format=E4M3FN, max={_FP8_E4M3_MAX})"
+                )
+            else:
+                logger.info("Qwen3MLP: MX FP8 quantization DISABLED (using standard fp32 nn.Linear)")
+            Qwen3MLP._mxfp8_logged = True
+
         if config.use_mxfp8:
             self.gate_proj = MXFP8Linear(self.hidden_size, self.intermediate_size, bias=False, config=config)
             self.up_proj = MXFP8Linear(self.hidden_size, self.intermediate_size, bias=False, config=config)
