@@ -89,6 +89,27 @@ class Qwen3Config(PreTrainedConfig):
             Beginning of stream token id.
         eos_token_id (`int`, *optional*):
             End of stream token id.
+        use_msd_truncation (`bool`, *optional*, defaults to `False`):
+            Enable MSD-first time-domain truncated dot-product simulation. Only effective
+            when one of the MXFP formats (use_mxfp8/6/4) is also active.
+        msd_cycle_budget (`int`, *optional*, defaults to 16):
+            Global default cycle budget B_base when no per-channel calibration data exists.
+        msd_online_delay (`int`, *optional*, defaults to 2):
+            MSD multiplier online delay delta (digits before first valid product digit).
+        msd_budget_dynamic_scale (`float`, *optional*, defaults to 1.0):
+            Scaling factor alpha for dynamic activation override:
+            B_final = B_base + alpha * max(0, E_act - E_threshold).
+        msd_budget_dynamic_threshold (`float`, *optional*, defaults to 0.0):
+            Threshold E_threshold for dynamic budget increase.
+        msd_budget_dynamic_mode (`str`, *optional*, defaults to `"linear"`):
+            Mode for dynamic budget override: "linear" or "step".
+        msd_deep_pipeline (`bool`, *optional*, defaults to `False`):
+            Enable cross-layer MSD streaming through MLP (gate->silu->*up->down).
+        msd_pipeline_precision_loss (`int`, *optional*, defaults to 2):
+            Per-stage precision loss (in digits) for each pipeline stage in deep pipelining mode.
+        msd_calibration_data (`dict`, *optional*):
+            Per-layer, per-channel offline B_base values populated by calibration utility.
+            Format: {"layer_name": [list of per-channel budgets]}.
 
     ```python
     >>> from transformers import Qwen3Model, Qwen3Config
@@ -156,6 +177,16 @@ class Qwen3Config(PreTrainedConfig):
         mxfp6_format: str | None = "e2m3",   # "e2m3" (max=7.5) or "e3m2" (max=28.0)
         use_mxfp4: bool | None = False,
         mxfp4_block_size: int | None = 32,
+        # MSD-first time-domain truncated dot-product simulation
+        use_msd_truncation: bool | None = False,
+        msd_cycle_budget: int | None = 16,
+        msd_online_delay: int | None = 2,
+        msd_budget_dynamic_scale: float | None = 1.0,
+        msd_budget_dynamic_threshold: float | None = 0.0,
+        msd_budget_dynamic_mode: str | None = "linear",
+        msd_deep_pipeline: bool | None = False,
+        msd_pipeline_precision_loss: int | None = 2,
+        msd_calibration_data: dict | None = None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -203,6 +234,15 @@ class Qwen3Config(PreTrainedConfig):
         self.mxfp6_format = mxfp6_format
         self.use_mxfp4 = use_mxfp4
         self.mxfp4_block_size = mxfp4_block_size
+        self.use_msd_truncation = use_msd_truncation
+        self.msd_cycle_budget = msd_cycle_budget
+        self.msd_online_delay = msd_online_delay
+        self.msd_budget_dynamic_scale = msd_budget_dynamic_scale
+        self.msd_budget_dynamic_threshold = msd_budget_dynamic_threshold
+        self.msd_budget_dynamic_mode = msd_budget_dynamic_mode
+        self.msd_deep_pipeline = msd_deep_pipeline
+        self.msd_pipeline_precision_loss = msd_pipeline_precision_loss
+        self.msd_calibration_data = msd_calibration_data
 
         super().__init__(**kwargs)
 

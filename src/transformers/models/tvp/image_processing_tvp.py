@@ -436,7 +436,7 @@ class TvpImageProcessor(BaseImageProcessor):
         do_pad = do_pad if do_pad is not None else self.do_pad
         pad_size = pad_size if pad_size is not None else self.pad_size
         constant_values = constant_values if constant_values is not None else self.constant_values
-        pad_mode = pad_mode if pad_mode else self.pad_mode
+        pad_mode = pad_mode or self.pad_mode
         do_normalize = do_normalize if do_normalize is not None else self.do_normalize
         do_flip_channel_order = (
             do_flip_channel_order if do_flip_channel_order is not None else self.do_flip_channel_order

@@ -337,7 +337,7 @@ class Llama4TextConfig(PreTrainedConfig):
             int((layer_idx + 1) % no_rope_layer_interval != 0) for layer_idx in range(self.num_hidden_layers)
         ]
 
-        self.no_rope_layers = no_rope_layers if no_rope_layers else default_no_rope_layers
+        self.no_rope_layers = no_rope_layers or default_no_rope_layers
 
         self.interleave_moe_layer_step = interleave_moe_layer_step
         self.moe_layers = (

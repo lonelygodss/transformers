@@ -248,7 +248,7 @@ class GraniteMoeHybridConfig(PreTrainedConfig):
     # overwrite the function to use in `HybridMambaAttentionDynamicCache`
     @property
     def layers_block_type(self):
-        return self.layer_types if self.layer_types else ["mamba"] * self.num_hidden_layers
+        return self.layer_types or ["mamba"] * self.num_hidden_layers
 
 
 __all__ = ["GraniteMoeHybridConfig"]

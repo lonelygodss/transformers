@@ -226,7 +226,7 @@ class DPTConfig(PreTrainedConfig):
         self.auxiliary_loss_weight = auxiliary_loss_weight
         self.semantic_loss_ignore_index = semantic_loss_ignore_index
         self.semantic_classifier_dropout = semantic_classifier_dropout
-        self.pooler_output_size = pooler_output_size if pooler_output_size else hidden_size
+        self.pooler_output_size = pooler_output_size or hidden_size
         self.pooler_act = pooler_act
         super().__init__(**kwargs)
 

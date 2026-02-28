@@ -50,6 +50,159 @@ from ...utils.output_capturing import capture_outputs
 from .configuration_qwen3 import Qwen3Config
 
 
+# ── MSD Compute Context ──────────────────────────────────────────────────────
+
+
+class MSDComputeContext:
+    """
+    Runtime context for MSD-first time-domain truncated dot-product simulation.
+
+    Carries per-channel cycle budgets, pipeline precision state, and
+    activation scale caches through the model forward pass.
+
+    Uses class-level _active to hold the context during a forward pass
+    (set by ForCausalLM, read by DecoderLayer).
+    """
+
+    _active = None
+
+    def __init__(self, channel_budgets, default_budget, config):
+        self.channel_budgets = channel_budgets
+        self.default_budget = default_budget
+        self.pipeline_precision_remaining = None
+        self.activation_scales = {}
+        self.budget_dynamic_scale = config.msd_budget_dynamic_scale
+        self.budget_dynamic_threshold = config.msd_budget_dynamic_threshold
+        self.budget_dynamic_mode = config.msd_budget_dynamic_mode
+        self.online_delay = config.msd_online_delay
+        self.pipeline_precision_loss = config.msd_pipeline_precision_loss
+
+    @staticmethod
+    def activate(ctx):
+        """Set ctx as the active MSD context for the current forward pass."""
+        MSDComputeContext._active = ctx
+
+    @staticmethod
+    def deactivate():
+        """Clear the active MSD context after the forward pass."""
+        MSDComputeContext._active = None
+
+    @staticmethod
+    def get_active():
+        """Return the currently active MSD context, or None."""
+        return MSDComputeContext._active
+
+    @staticmethod
+    def create_from_config(config, model):
+        """
+        Factory: create an MSDComputeContext from config and model.
+        Loads per-channel calibration data if available, else uses uniform default.
+        Also registers layer_name on each _MXFPLinearBase module.
+        """
+        channel_budgets = {}
+        calibration_data = config.msd_calibration_data
+        for name, module in model.named_modules():
+            if isinstance(module, _MXFPLinearBase):
+                module.layer_name = name
+                module._msd_config = config
+                if calibration_data and name in calibration_data:
+                    budgets_list = calibration_data[name]
+                    channel_budgets[name] = torch.tensor(budgets_list, dtype=torch.float32)
+                else:
+                    channel_budgets[name] = torch.full(
+                        (module.out_features,), float(config.msd_cycle_budget), dtype=torch.float32
+                    )
+        return MSDComputeContext(channel_budgets, config.msd_cycle_budget, config)
+
+
+# ── Two-level delay computation ──────────────────────────────────────────────
+
+
+def _safe_log2(x):
+    """log2 that maps 0 and negative values to a large negative number."""
+    return torch.where(x > 0, torch.log2(x), torch.tensor(-60.0, dtype=x.dtype, device=x.device))
+
+
+def _compute_inter_block_delays(w_scales, x_scales):
+    """
+    Compute inter-block delays from shared MX block scales.
+
+    The combined log2 scale for block i in output (n, j) is:
+        E_i = floor(log2(w_scales[j, i] * x_scales[n, i]))
+    Delay = E_max - E_i for each output element.
+
+    Args:
+        w_scales: (out, nb) fp32 shared scales for weight blocks
+        x_scales: (N, nb) fp32 shared scales for activation blocks
+    Returns:
+        inter_block_delays: (N, out, nb) int-valued fp32 tensor
+        e_max: (N, out) maximum combined log2 scale
+    """
+    # Combined log2 scale: (N, 1, nb) + (1, out, nb) -> (N, out, nb)
+    log2_x = _safe_log2(x_scales).unsqueeze(1)  # (N, 1, nb)
+    log2_w = _safe_log2(w_scales).unsqueeze(0)  # (1, out, nb)
+    combined_log2 = log2_x + log2_w  # (N, out, nb)
+    combined_e = torch.floor(combined_log2)  # integer exponents
+
+    e_max = combined_e.amax(dim=-1)  # (N, out)
+    inter_block_delays = e_max.unsqueeze(-1) - combined_e  # (N, out, nb)
+    return inter_block_delays, e_max
+
+
+def _compute_intra_block_delays(x_q_blocks):
+    """
+    Compute intra-block delays from individual activation element exponents.
+
+    Within each block, elements with smaller exponents start later.
+    Weights are pre-aligned to fixed-point offline (no intra-block delay).
+
+    Args:
+        x_q_blocks: (N, nb, bs) quantized activation elements (float32)
+    Returns:
+        intra_block_delays: (N, nb, bs) int-valued fp32 tensor
+    """
+    abs_vals = x_q_blocks.abs()
+    # log2 of absolute value; zeros get large delay
+    elem_log2 = torch.where(
+        abs_vals > 0,
+        torch.floor(torch.log2(abs_vals)),
+        torch.tensor(-60.0, dtype=x_q_blocks.dtype, device=x_q_blocks.device),
+    )
+    # Per-block max exponent
+    e_max_block = elem_log2.amax(dim=-1, keepdim=True)  # (N, nb, 1)
+    intra_block_delays = e_max_block - elem_log2  # (N, nb, bs)
+    return intra_block_delays
+
+
+# ── MSD truncation primitive ─────────────────────────────────────────────────
+
+
+def _msd_truncate(value, num_digits):
+    """
+    Truncate each element to its `num_digits` most significant binary digits.
+
+    Models the effect of MSD-first computation under a cycle budget:
+    only the top `num_digits` digits of each value survive.
+
+    Args:
+        value: float32 tensor (any shape)
+        num_digits: float32 tensor (same shape or broadcastable), effective precision
+    Returns:
+        truncated: float32 tensor, same shape as value
+    """
+    abs_v = value.abs()
+    # Position of MSB: floor(log2(|v|))
+    msb_pos = torch.floor(torch.log2(abs_v.clamp(min=1e-45)))
+    # Quantum: value of the least significant kept digit
+    # quantum = 2^(msb_pos - num_digits + 1)
+    quantum = torch.pow(2.0, msb_pos - num_digits + 1.0)
+    # Truncate by rounding down to nearest quantum
+    truncated = torch.trunc(value / quantum) * quantum
+    # Zero out elements with num_digits <= 0 or value == 0
+    mask = (num_digits > 0) & (abs_v > 0)
+    return torch.where(mask, truncated, torch.zeros_like(value))
+
+
 # ── Shared base class ────────────────────────────────────────────────────────
 
 
@@ -72,6 +225,8 @@ class _MXFPLinearBase(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.block_size = self._get_block_size(config)
+        self._msd_config = config  # stored for MSD truncation parameters
+        self.layer_name = None  # set by _create_msd_context after model init
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         if bias:
             self.bias_param = nn.Parameter(torch.empty(out_features))
@@ -125,6 +280,107 @@ class _MXFPLinearBase(nn.Module):
         q, scales = self._quantize_to_blocks(blocks)
         return q, scales, pad_len
 
+    def _resolve_channel_budgets(self, compute_context, x_scales, N):
+        """
+        Resolve per-output-channel cycle budgets using hybrid Glocal budgeting.
+
+        Args:
+            compute_context: MSDComputeContext or None
+            x_scales: (N, nb) activation shared scales
+            N: batch size
+        Returns:
+            b_final: (N, out) per-sample, per-output-channel final budget
+        """
+        cfg = self._msd_config
+        # Base budget per output channel
+        if compute_context is not None and self.layer_name in compute_context.channel_budgets:
+            b_base = compute_context.channel_budgets[self.layer_name].to(x_scales.device)  # (out,)
+        else:
+            b_base = torch.full(
+                (self.out_features,), float(cfg.msd_cycle_budget), dtype=torch.float32, device=x_scales.device
+            )
+        # Dynamic activation override: E_act = floor(log2(max activation scale per sample))
+        max_x_scale = x_scales.amax(dim=-1)  # (N,)
+        e_act = torch.floor(_safe_log2(max_x_scale))  # (N,)
+
+        threshold = cfg.msd_budget_dynamic_threshold
+        alpha = cfg.msd_budget_dynamic_scale
+        mode = cfg.msd_budget_dynamic_mode
+
+        if mode == "step":
+            delta_b = torch.where(
+                e_act > threshold,
+                torch.tensor(alpha, dtype=torch.float32, device=x_scales.device),
+                torch.tensor(0.0, dtype=torch.float32, device=x_scales.device),
+            )  # (N,)
+        else:  # "linear" (default)
+            delta_b = alpha * torch.clamp(e_act - threshold, min=0.0)  # (N,)
+
+        # b_final: (N, out) = (1, out) + (N, 1)
+        b_final = b_base.unsqueeze(0) + delta_b.unsqueeze(1)
+        return b_final
+
+    def _forward_msd_truncated(self, x_q, x_scales, w_q, w_scales, N, compute_context):
+        """
+        MSD-first truncated dot-product simulation.
+
+        Computes the dot-product with two-level time-domain delays
+        (inter-block from shared scales, intra-block from element exponents)
+        and cycle-budget-based early termination.
+
+        Args:
+            x_q:      (N, nb, bs) quantized activation blocks (float32)
+            x_scales: (N, nb) activation block shared scales
+            w_q:      (out, nb, bs) quantized weight blocks (float32)
+            w_scales: (out, nb) weight block shared scales
+            N:        batch dimension
+            compute_context: MSDComputeContext or None
+        Returns:
+            result: (N, out) float32
+        """
+        cfg = self._msd_config
+        nb = x_q.shape[1]
+        bs = x_q.shape[2]
+        out = w_q.shape[0]
+        online_delay = cfg.msd_online_delay
+
+        # 1. Inter-block delays from shared scales: (N, out, nb)
+        inter_delays, _ = _compute_inter_block_delays(w_scales, x_scales)
+
+        # 2. Intra-block delays from activation element exponents: (N, nb, bs)
+        intra_delays = _compute_intra_block_delays(x_q)
+
+        # 3. Per-channel budget: (N, out)
+        b_final = self._resolve_channel_budgets(compute_context, x_scales, N)
+
+        # 4. Element-wise products: (N, out, nb, bs)
+        # x_q: (N, nb, bs) -> (N, 1, nb, bs);  w_q: (out, nb, bs) -> (1, out, nb, bs)
+        prods = x_q.unsqueeze(1) * w_q.unsqueeze(0)  # (N, out, nb, bs)
+
+        # 5. Total delay per element: (N, out, nb, bs)
+        # inter_delays: (N, out, nb) -> (N, out, nb, 1)
+        # intra_delays: (N, nb, bs) -> (N, 1, nb, bs)
+        total_delay = inter_delays.unsqueeze(-1) + intra_delays.unsqueeze(1) + online_delay  # (N, out, nb, bs)
+
+        # 6. Effective precision: (N, out, nb, bs)
+        # b_final: (N, out) -> (N, out, 1, 1)
+        p_eff = b_final.unsqueeze(-1).unsqueeze(-1) - total_delay
+        p_eff = torch.clamp(p_eff, min=0.0)
+
+        # 7. Truncate each element-wise product to its effective precision
+        prods_trunc = _msd_truncate(prods, p_eff)
+
+        # 8. Sum within blocks: (N, out, nb)
+        block_dots = prods_trunc.sum(dim=-1)
+
+        # 9. Apply shared scales: combined_scales (N, out, nb)
+        # x_scales: (N, nb) -> (N, 1, nb);  w_scales: (out, nb) -> (1, out, nb)
+        combined_scales = x_scales.unsqueeze(1) * w_scales.unsqueeze(0)  # (N, out, nb)
+
+        # 10. Final summation across blocks
+        result = (block_dots * combined_scales).sum(dim=-1)  # (N, out)
+        return result
+
     def forward(self, x: torch.Tensor, compute_context=None) -> torch.Tensor:
         """
         MX-format block-wise forward pass.
@@ -132,7 +388,8 @@ class _MXFPLinearBase(nn.Module):
         For each block b along in_features:
             out[n, j] += scale_x[n, b] * scale_w[j, b] * dot(x_q[n, b, :], w_q[j, b, :])
 
-        Scales are fp32; element dot-products use low-precision-simulated float32.
+        When use_msd_truncation is enabled, uses time-domain truncated dot-product
+        with two-level delays and cycle budgeting.
         """
         orig_dtype = x.dtype
         batch_shape = x.shape[:-1]
@@ -144,21 +401,21 @@ class _MXFPLinearBase(nn.Module):
         x_q, x_scales, _ = self._prepare_blocks(x_2d, N)  # (N,   nb, bs), (N,   nb)
         w_q, w_scales, _ = self._prepare_blocks(w_2d, self.out_features)  # (out, nb, bs), (out, nb)
 
-        # Batched block-wise matmul:
-        #   x_q: (N,   nb, bs) -> (nb, N,  bs)
-        #   w_q: (out, nb, bs) -> (nb, bs, out)
-        #   bmm -> (nb, N, out)
-        elem_dots = torch.bmm(
-            x_q.permute(1, 0, 2),  # (nb, N,  bs)
-            w_q.permute(1, 2, 0),  # (nb, bs, out)
-        )  # (nb, N, out)
+        use_msd = getattr(self._msd_config, "use_msd_truncation", False) if self._msd_config else False
 
-        # Combined fp32 scale product: (nb, N, 1) * (nb, 1, out) -> (nb, N, out)
-        combined_scales = x_scales.t().unsqueeze(-1) * w_scales.t().unsqueeze(1)
+        if use_msd:
+            # MSD-first truncated dot-product path
+            result = self._forward_msd_truncated(x_q, x_scales, w_q, w_scales, N, compute_context)
+        else:
+            # Standard exact MX block-wise matmul path
+            elem_dots = torch.bmm(
+                x_q.permute(1, 0, 2),  # (nb, N,  bs)
+                w_q.permute(1, 2, 0),  # (nb, bs, out)
+            )  # (nb, N, out)
 
-        # Placeholder for future MSB-first bit-serial computation implementation
+            combined_scales = x_scales.t().unsqueeze(-1) * w_scales.t().unsqueeze(1)
 
-        result = (elem_dots * combined_scales).sum(dim=0)  # (N, out)
+            result = (elem_dots * combined_scales).sum(dim=0)  # (N, out)
 
         if self.bias_param is not None:
             result = result + self.bias_param
@@ -363,6 +620,43 @@ class Qwen3RMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
+# ── Deep pipeline helpers ────────────────────────────────────────────────────
+
+
+def _msd_silu(x, precision_digits):
+    """
+    Apply SiLU activation in MSD-simulated mode.
+
+    Applies float SiLU then truncates to model digit-loss from
+    MSD-first nonlinear evaluation (avoids true digit-serial CORDIC SiLU).
+
+    Args:
+        x: float32 tensor
+        precision_digits: float32 tensor or scalar, per-element precision
+    Returns:
+        truncated SiLU output
+    """
+    result = F.silu(x)
+    return _msd_truncate(result, precision_digits)
+
+
+def _msd_elementwise_mul(a, b, precision_digits):
+    """
+    MSD-simulated element-wise multiply.
+
+    Product of two P-digit MSD values produces 2P digits, but output
+    stream retains only precision_digits (modeling online delay loss).
+
+    Args:
+        a, b: float32 tensors (same shape)
+        precision_digits: float32 tensor or scalar, per-element output precision
+    Returns:
+        truncated element-wise product
+    """
+    result = a * b
+    return _msd_truncate(result, precision_digits)
+
+
 # Mapping from config flag to linear class (evaluated lazily so subclasses are always defined)
 _MXFP_LINEAR_REGISTRY = {
     "use_mxfp8": MXFP8Linear,
@@ -396,9 +690,62 @@ class Qwen3MLP(nn.Module):
         self.down_proj = _make_linear(self.intermediate_size, self.hidden_size, config)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+    def forward(self, x, compute_context=None):
+        use_msd = getattr(self.config, "use_msd_truncation", False)
+        use_pipeline = getattr(self.config, "msd_deep_pipeline", False)
+
+        if use_msd and use_pipeline and compute_context is not None:
+            # Deep pipeline: track precision through gate->silu->*up->down
+            cfg = self.config
+
+            # Stage 1: gate_proj and up_proj (independent, parallel dot-products)
+            gate_out = self.gate_proj(x, compute_context=compute_context)
+            up_out = self.up_proj(x, compute_context=compute_context)
+
+            # Effective output precision from dot-products: use the budget as proxy
+            # (the minimum effective precision across blocks/elements per channel)
+            p_gate = float(cfg.msd_cycle_budget)
+            p_up = float(cfg.msd_cycle_budget)
+            if compute_context is not None and compute_context.pipeline_precision_remaining is not None:
+                p_gate = compute_context.pipeline_precision_remaining
+                p_up = compute_context.pipeline_precision_remaining
+
+            # Stage 2: SiLU on gate output (precision loss from nonlinear MSD eval)
+            precision_loss = cfg.msd_pipeline_precision_loss
+            if isinstance(p_gate, (int, float)):
+                p_after_silu = max(0, p_gate - precision_loss)
+            else:
+                p_after_silu = torch.clamp(p_gate - precision_loss, min=0.0)
+            silu_out = _msd_silu(gate_out, p_after_silu)
+
+            # Stage 3: element-wise multiply (online multiplier delay)
+            online_delay = cfg.msd_online_delay
+            if isinstance(p_after_silu, (int, float)):
+                p_after_mul = max(0, min(p_after_silu, p_up) - online_delay)
+            else:
+                p_after_mul = (
+                    torch.clamp(torch.minimum(p_after_silu, p_up) - online_delay, min=0.0)
+                    if not isinstance(p_up, (int, float))
+                    else torch.clamp(p_after_silu - online_delay, min=0.0)
+                )
+            intermediate = _msd_elementwise_mul(silu_out, up_out, p_after_mul)
+
+            # Stage 4: down_proj with reduced input precision
+            compute_context.pipeline_precision_remaining = p_after_mul
+            result = self.down_proj(intermediate, compute_context=compute_context)
+            # Reset pipeline state after completing the MLP
+            compute_context.pipeline_precision_remaining = None
+            return result
+        elif use_msd:
+            # MSD truncation without deep pipeline: standard structure, pass context
+            gate_out = self.gate_proj(x, compute_context=compute_context)
+            up_out = self.up_proj(x, compute_context=compute_context)
+            intermediate = self.act_fn(gate_out) * up_out
+            return self.down_proj(intermediate, compute_context=compute_context)
+        else:
+            # Standard forward pass
+            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+            return down_proj
 
 
 class Qwen3RotaryEmbedding(nn.Module):
@@ -613,6 +960,11 @@ class Qwen3Attention(nn.Module):
 
 
 class Qwen3DecoderLayer(GradientCheckpointingLayer):
+    """
+    Qwen3 decoder layer. Overrides Qwen2DecoderLayer to thread compute_context
+    through to the MLP for MSD-first simulation.
+    """
+
     def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -635,9 +987,12 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
+        # Get compute_context from module-level holder (set by ForCausalLM)
+        compute_context = MSDComputeContext.get_active()
+
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        # Self Attention
+        # Self Attention (no MSD context needed for attention projections)
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -650,10 +1005,10 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         )
         hidden_states = residual + hidden_states
 
-        # Fully Connected
+        # Fully Connected (thread compute_context to MLP)
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, compute_context=compute_context)
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -821,6 +1176,17 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
+        # Create MSD compute context if MSD truncation is active
+        use_msd = getattr(self.config, "use_msd_truncation", False)
+        has_mxfp = (
+            getattr(self.config, "use_mxfp8", False)
+            or getattr(self.config, "use_mxfp6", False)
+            or getattr(self.config, "use_mxfp4", False)
+        )
+        if use_msd and has_mxfp:
+            MSDComputeContext.activate(MSDComputeContext.create_from_config(self.config, self.model))
+        else:
+            MSDComputeContext.deactivate()
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -867,6 +1233,7 @@ __all__ = [
     "Qwen3ForQuestionAnswering",
     "Qwen3PreTrainedModel",
     "Qwen3Model",
+    "Qwen3DecoderLayer",
     "Qwen3ForSequenceClassification",
     "Qwen3ForTokenClassification",
 ]

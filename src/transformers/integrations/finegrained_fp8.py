@@ -42,7 +42,7 @@ def _get_quantization_kernel():
         except Exception as e:
             logger.warning_once(f"Failed to load CUTLASS quantization kernel: {e}. Falling back to Triton.")
             _quantization_kernel = False  # Mark as unavailable
-    return _quantization_kernel if _quantization_kernel else None
+    return _quantization_kernel or None
 
 
 def _supports_cutlass(block_size: list[int] | None, output_dtype: torch.dtype) -> bool:

@@ -117,7 +117,7 @@ class ViTConfig(PreTrainedConfig):
         self.num_channels = num_channels
         self.qkv_bias = qkv_bias
         self.encoder_stride = encoder_stride
-        self.pooler_output_size = pooler_output_size if pooler_output_size else hidden_size
+        self.pooler_output_size = pooler_output_size or hidden_size
         self.pooler_act = pooler_act
 
         super().__init__(**kwargs)
