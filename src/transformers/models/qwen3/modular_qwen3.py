@@ -834,6 +834,32 @@ class Qwen3DecoderLayer(Qwen2DecoderLayer):
 
 
 class Qwen3ForCausalLM(Qwen2ForCausalLM):
+    _msd_context = None
+    _msd_context_config_hash = None
+
+    def _get_msd_context(self):
+        """Return cached MSDComputeContext, creating or refreshing only when config changes."""
+        cfg = self.config
+        # Simple hash of MSD-relevant config fields to detect changes
+        cfg_hash = (
+            getattr(cfg, "use_msd_truncation", False),
+            getattr(cfg, "use_mxfp8", False),
+            getattr(cfg, "use_mxfp6", False),
+            getattr(cfg, "use_mxfp4", False),
+            getattr(cfg, "msd_cycle_budget", 16),
+            getattr(cfg, "msd_online_delay", 2),
+            getattr(cfg, "msd_budget_dynamic_scale", 1.0),
+            getattr(cfg, "msd_budget_dynamic_threshold", 0.0),
+            getattr(cfg, "msd_budget_dynamic_mode", "linear"),
+            getattr(cfg, "msd_deep_pipeline", False),
+            getattr(cfg, "msd_pipeline_precision_loss", 2),
+            id(getattr(cfg, "msd_calibration_data", None)),
+        )
+        if self._msd_context is None or self._msd_context_config_hash != cfg_hash:
+            self._msd_context = MSDComputeContext.create_from_config(cfg, self.model)
+            self._msd_context_config_hash = cfg_hash
+        return self._msd_context
+
     def forward(
         self,
         **super_kwargs: Unpack[TransformersKwargs],
@@ -860,14 +886,15 @@ class Qwen3ForCausalLM(Qwen2ForCausalLM):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
-        # Create MSD compute context if MSD truncation is active
+        # Activate cached MSD compute context if MSD truncation is active
         use_msd = getattr(self.config, "use_msd_truncation", False)
         has_mxfp = getattr(self.config, "use_mxfp8", False) or getattr(self.config, "use_mxfp6", False) or getattr(self.config, "use_mxfp4", False)
         if use_msd and has_mxfp:
-            MSDComputeContext.activate(MSDComputeContext.create_from_config(self.config, self.model))
-        else:
+            MSDComputeContext.activate(self._get_msd_context())
+        try:
+            return super().forward(**super_kwargs)
+        finally:
             MSDComputeContext.deactivate()
-        return super().forward(**super_kwargs)
 
 
 class Qwen3ForSequenceClassification(Qwen2ForSequenceClassification):

@@ -1129,6 +1129,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_gather_output"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    _msd_context = None
+    _msd_context_config_hash = None
 
     def __init__(self, config):
         super().__init__(config)
@@ -1176,7 +1178,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
-        # Create MSD compute context if MSD truncation is active
+        # Activate cached MSD compute context if MSD truncation is active
         use_msd = getattr(self.config, "use_msd_truncation", False)
         has_mxfp = (
             getattr(self.config, "use_mxfp8", False)
@@ -1184,36 +1186,60 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             or getattr(self.config, "use_mxfp4", False)
         )
         if use_msd and has_mxfp:
-            MSDComputeContext.activate(MSDComputeContext.create_from_config(self.config, self.model))
-        else:
+            MSDComputeContext.activate(self._get_msd_context())
+        try:
+            outputs: BaseModelOutputWithPast = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+            hidden_states = outputs.last_hidden_state
+            # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+            loss = None
+            if labels is not None:
+                loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+
+            return CausalLMOutputWithPast(
+                loss=loss,
+                logits=logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
+        finally:
             MSDComputeContext.deactivate()
-        outputs: BaseModelOutputWithPast = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            **kwargs,
+
+    def _get_msd_context(self):
+        """Return cached MSDComputeContext, creating or refreshing only when config changes."""
+        cfg = self.config
+        # Simple hash of MSD-relevant config fields to detect changes
+        cfg_hash = (
+            getattr(cfg, "use_msd_truncation", False),
+            getattr(cfg, "use_mxfp8", False),
+            getattr(cfg, "use_mxfp6", False),
+            getattr(cfg, "use_mxfp4", False),
+            getattr(cfg, "msd_cycle_budget", 16),
+            getattr(cfg, "msd_online_delay", 2),
+            getattr(cfg, "msd_budget_dynamic_scale", 1.0),
+            getattr(cfg, "msd_budget_dynamic_threshold", 0.0),
+            getattr(cfg, "msd_budget_dynamic_mode", "linear"),
+            getattr(cfg, "msd_deep_pipeline", False),
+            getattr(cfg, "msd_pipeline_precision_loss", 2),
+            id(getattr(cfg, "msd_calibration_data", None)),
         )
-
-        hidden_states = outputs.last_hidden_state
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
-
-        loss = None
-        if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
-
-        return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
+        if self._msd_context is None or self._msd_context_config_hash != cfg_hash:
+            self._msd_context = MSDComputeContext.create_from_config(cfg, self.model)
+            self._msd_context_config_hash = cfg_hash
+        return self._msd_context
 
 
 class Qwen3ForSequenceClassification(GenericForSequenceClassification, Qwen3PreTrainedModel):
