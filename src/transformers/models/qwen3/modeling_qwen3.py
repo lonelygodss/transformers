@@ -320,13 +320,18 @@ class _MXFPLinearBase(nn.Module):
         b_final = b_base.unsqueeze(0) + delta_b.unsqueeze(1)
         return b_final
 
+    # Target bytes for the largest intermediate 4D tensor per chunk.
+    # 2 GiB keeps peak well within a single 32 GB GPU even with several
+    # live temporaries.
+    _MSD_CHUNK_TARGET_BYTES: int = 2 * 1024 ** 3  # 2 GiB
+
     def _forward_msd_truncated(self, x_q, x_scales, w_q, w_scales, N, compute_context):
         """
-        MSD-first truncated dot-product simulation.
+        MSD-first truncated dot-product simulation (output-chunked).
 
-        Computes the dot-product with two-level time-domain delays
-        (inter-block from shared scales, intra-block from element exponents)
-        and cycle-budget-based early termination.
+        Identical maths to the non-chunked version, but processes a slice
+        of the output dimension at a time so that the peak 4D intermediate
+        tensor `(N, chunk, nb, bs)` stays under `_MSD_CHUNK_TARGET_BYTES`.
 
         Args:
             x_q:      (N, nb, bs) quantized activation blocks (float32)
@@ -344,41 +349,67 @@ class _MXFPLinearBase(nn.Module):
         out = w_q.shape[0]
         online_delay = cfg.msd_online_delay
 
-        # 1. Inter-block delays from shared scales: (N, out, nb)
-        inter_delays, _ = _compute_inter_block_delays(w_scales, x_scales)
-
-        # 2. Intra-block delays from activation element exponents: (N, nb, bs)
+        # ── Pre-loop: tensors that do NOT depend on the output slice ──
+        # Intra-block delays from activation element exponents: (N, nb, bs)
         intra_delays = _compute_intra_block_delays(x_q)
-
-        # 3. Per-channel budget: (N, out)
+        # Per-channel budget: (N, out)
         b_final = self._resolve_channel_budgets(compute_context, x_scales, N)
+        # Pre-compute log2 scales for inter-block delay (avoids recomputing per chunk)
+        log2_x = _safe_log2(x_scales).unsqueeze(1)  # (N, 1, nb)
+        log2_w_full = _safe_log2(w_scales)           # (out, nb)
 
-        # 4. Element-wise products: (N, out, nb, bs)
-        # x_q: (N, nb, bs) -> (N, 1, nb, bs);  w_q: (out, nb, bs) -> (1, out, nb, bs)
-        prods = x_q.unsqueeze(1) * w_q.unsqueeze(0)  # (N, out, nb, bs)
+        # ── Determine output chunk size ──
+        # Largest 4D tensor per chunk is (N, chunk, nb, bs) in float32 (4 bytes).
+        elem_per_slice = N * nb * bs  # elements for chunk=1
+        chunk_size = max(1, self._MSD_CHUNK_TARGET_BYTES // (4 * elem_per_slice))
+        chunk_size = min(chunk_size, out)  # never exceed actual output dim
 
-        # 5. Total delay per element: (N, out, nb, bs)
-        # inter_delays: (N, out, nb) -> (N, out, nb, 1)
-        # intra_delays: (N, nb, bs) -> (N, 1, nb, bs)
-        total_delay = inter_delays.unsqueeze(-1) + intra_delays.unsqueeze(1) + online_delay  # (N, out, nb, bs)
+        # ── Allocate output ──
+        result = torch.zeros(N, out, dtype=torch.float32, device=x_q.device)
 
-        # 6. Effective precision: (N, out, nb, bs)
-        # b_final: (N, out) -> (N, out, 1, 1)
-        p_eff = b_final.unsqueeze(-1).unsqueeze(-1) - total_delay
-        p_eff = torch.clamp(p_eff, min=0.0)
+        # Pre-expand x for broadcasting (N, 1, nb, bs) — small, shared across chunks
+        x_q_exp = x_q.unsqueeze(1)              # (N, 1, nb, bs)
+        intra_exp = intra_delays.unsqueeze(1)    # (N, 1, nb, bs)
+        x_scales_exp = x_scales.unsqueeze(1)     # (N, 1, nb)
 
-        # 7. Truncate each element-wise product to its effective precision
-        prods_trunc = _msd_truncate(prods, p_eff)
+        for j0 in range(0, out, chunk_size):
+            j1 = min(j0 + chunk_size, out)
+            c = j1 - j0  # current chunk width
 
-        # 8. Sum within blocks: (N, out, nb)
-        block_dots = prods_trunc.sum(dim=-1)
+            # Slice weight-side tensors along output dim
+            w_q_c = w_q[j0:j1]           # (c, nb, bs)
+            w_scales_c = w_scales[j0:j1]  # (c, nb)
+            b_final_c = b_final[:, j0:j1]  # (N, c)
 
-        # 9. Apply shared scales: combined_scales (N, out, nb)
-        # x_scales: (N, nb) -> (N, 1, nb);  w_scales: (out, nb) -> (1, out, nb)
-        combined_scales = x_scales.unsqueeze(1) * w_scales.unsqueeze(0)  # (N, out, nb)
+            # 1. Inter-block delays for this chunk: (N, c, nb)
+            log2_w_c = log2_w_full[j0:j1].unsqueeze(0)  # (1, c, nb)
+            combined_e = torch.floor(log2_x + log2_w_c)  # (N, c, nb)
+            e_max_c = combined_e.amax(dim=-1)             # (N, c)
+            inter_delays_c = e_max_c.unsqueeze(-1) - combined_e  # (N, c, nb)
 
-        # 10. Final summation across blocks
-        result = (block_dots * combined_scales).sum(dim=-1)  # (N, out)
+            # 2. Element-wise products: (N, c, nb, bs)
+            prods = x_q_exp * w_q_c.unsqueeze(0)  # (N, c, nb, bs)
+
+            # 3. Total delay: (N, c, nb, bs)
+            total_delay = inter_delays_c.unsqueeze(-1) + intra_exp + online_delay
+
+            # 4. Effective precision: (N, c, nb, bs)
+            p_eff = b_final_c.unsqueeze(-1).unsqueeze(-1) - total_delay
+            p_eff = torch.clamp(p_eff, min=0.0)
+            del total_delay  # free 4D tensor early
+
+            # 5. Truncate products
+            prods_trunc = _msd_truncate(prods, p_eff)
+            del prods, p_eff
+
+            # 6. Sum within blocks & apply shared scales: (N, c, nb) -> (N, c)
+            block_dots = prods_trunc.sum(dim=-1)
+            del prods_trunc
+
+            combined_scales = x_scales_exp * w_scales_c.unsqueeze(0)  # (N, c, nb)
+            result[:, j0:j1] = (block_dots * combined_scales).sum(dim=-1)
+            del block_dots, combined_scales, inter_delays_c
+
         return result
 
     def forward(self, x: torch.Tensor, compute_context=None) -> torch.Tensor:
