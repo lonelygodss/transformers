@@ -189,6 +189,9 @@ def _msd_truncate(value, num_digits):
         num_digits: float32 tensor (same shape or broadcastable), effective precision
     Returns:
         truncated: float32 tensor, same shape as value
+    
+    Todo:
+        this function currently truncate on Binary representation, our goal is to simulate with BSD.
     """
     abs_v = value.abs()
     # Position of MSB: floor(log2(|v|))
@@ -290,6 +293,10 @@ class _MXFPLinearBase(nn.Module):
             N: batch size
         Returns:
             b_final: (N, out) per-sample, per-output-channel final budget
+        Todos:
+            dynamic budgeting currently only uses activation scales, our online arithmetic approach should consider 
+            both weight and activation scales, since the combined scale is already computed in the inter-block delay 
+            calculation, we can reuse it to determine the dynamic budget. We will add this in the next iteration.
         """
         cfg = self._msd_config
         # Base budget per output channel
@@ -306,7 +313,9 @@ class _MXFPLinearBase(nn.Module):
         threshold = cfg.msd_budget_dynamic_threshold
         alpha = cfg.msd_budget_dynamic_scale
         mode = cfg.msd_budget_dynamic_mode
-
+        # step mode: The budget increases by a fixed amount (alpha) only if the activation exponent exceeds a threshold. 
+        #   It's a binary switch—either the budget is increased by a set value or not at all. 
+        #   This is useful when you want a simple, predictable jump in resources for "hard" cases, but no gradual scaling.
         if mode == "step":
             delta_b = torch.where(
                 e_act > threshold,
@@ -342,6 +351,10 @@ class _MXFPLinearBase(nn.Module):
             compute_context: MSDComputeContext or None
         Returns:
             result: (N, out) float32
+        Todos:
+            two-level delays is not correctly implemented, only intra-block delay is considered 
+            in the current implementation, we will add inter-block delay and the dynamic 
+            budgeting based on combined activation and weight scales in the next iteration.
         """
         cfg = self._msd_config
         nb = x_q.shape[1]
@@ -353,6 +366,11 @@ class _MXFPLinearBase(nn.Module):
         # Intra-block delays from activation element exponents: (N, nb, bs)
         intra_delays = _compute_intra_block_delays(x_q)
         # Per-channel budget: (N, out)
+        # Dynamic budget need to consider shared scale of both activation and weight,
+        # which is not implemented in the current iteration, we will add this in the next iteration.
+        # Each channel consists of nb blocks, and the channel budget depends on the scale of 
+        # the final sums, which is predicted by the product of the shared scales of activation and weight.
+        # It's relative to inter-block delay.
         b_final = self._resolve_channel_budgets(compute_context, x_scales, N)
         # Pre-compute log2 scales for inter-block delay (avoids recomputing per chunk)
         log2_x = _safe_log2(x_scales).unsqueeze(1)  # (N, 1, nb)
@@ -377,6 +395,9 @@ class _MXFPLinearBase(nn.Module):
             c = j1 - j0  # current chunk width
 
             # Slice weight-side tensors along output dim
+            # Seems the dynamic budget should be computed here with the combined activation and weight scales, 
+            # since the budget is relative to the inter-block delay, 
+            # which is determined by the combined scales. We will add this in the next iteration.
             w_q_c = w_q[j0:j1]           # (c, nb, bs)
             w_scales_c = w_scales[j0:j1]  # (c, nb)
             b_final_c = b_final[:, j0:j1]  # (N, c)
@@ -391,14 +412,24 @@ class _MXFPLinearBase(nn.Module):
             prods = x_q_exp * w_q_c.unsqueeze(0)  # (N, c, nb, bs)
 
             # 3. Total delay: (N, c, nb, bs)
+            # Online delay is a hierachical delay for subsequent operations.
+            # The current implementation might be too rough. For example, a 
+            # MSD-first multiplication might have delay of 2 cycles, and the 
+            # subsequent addition tree might have delay of 3 cycles, so the total
+            # delay of the MSD of dot-product will be 5 cycles. Need to refine.
             total_delay = inter_delays_c.unsqueeze(-1) + intra_exp + online_delay
 
             # 4. Effective precision: (N, c, nb, bs)
+            # This calcuation yields the width of the results of dot-product in the MSD-first manner,
+            # which is the effective precision of the products after the given total delay.
             p_eff = b_final_c.unsqueeze(-1).unsqueeze(-1) - total_delay
             p_eff = torch.clamp(p_eff, min=0.0)
             del total_delay  # free 4D tensor early
 
             # 5. Truncate products
+            # The problem here is also indicated in _msd_trncate(), 
+            # which is the current truncation is based on the binary representation, 
+            # rather than the BSD, we will add the BSD-based truncation in the next iteration.
             prods_trunc = _msd_truncate(prods, p_eff)
             del prods, p_eff
 
@@ -406,6 +437,12 @@ class _MXFPLinearBase(nn.Module):
             block_dots = prods_trunc.sum(dim=-1)
             del prods_trunc
 
+            # The combined scale has already been used when determining inter-block delays, 
+            # which results in the truncation of block-wise dot-products. We multiply it with
+            # block_dots here due to the fact that we are not simulating all the hardware operations.
+            # In real hardware, this scale is considered with a time-domain shift-and-add approach, 
+            # with the delay already determined. Here we restore the results in a equivalent but faster way
+            # for gpus, which will not be changed in future iterations.
             combined_scales = x_scales_exp * w_scales_c.unsqueeze(0)  # (N, c, nb)
             result[:, j0:j1] = (block_dots * combined_scales).sum(dim=-1)
             del block_dots, combined_scales, inter_delays_c
