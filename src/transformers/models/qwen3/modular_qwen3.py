@@ -262,14 +262,71 @@ def _compute_intra_block_delays(x_q_blocks):
     return intra_block_delays
 
 
-# ── MSD truncation primitive ─────────────────────────────────────────────────
+# ── MSD truncation primitive (BSD / Non-Adjacent Form) ──────────────────────
+
+
+def _to_naf_components(x_int):
+    """
+    Convert integer tensor to Non-Adjacent Form (NAF) positive/negative masks.
+
+    NAF is the unique BSD representation with no adjacent non-zero digits
+    and minimum Hamming weight (fewest non-zero digits). It is computed via
+    the vectorised identity:
+        x_h  = x >> 1
+        s    = x + x_h
+        naf_pos = s & ~x_h   (positions where digit = +1)
+        naf_neg = x_h & ~s   (positions where digit = -1)
+    so that  x  =  naf_pos - naf_neg.
+
+    Args:
+        x_int: int32 tensor of non-negative integers
+    Returns:
+        naf_pos: int32 tensor, bitmask of +1 digit positions
+        naf_neg: int32 tensor, bitmask of -1 digit positions
+    """
+    x_h = x_int >> 1
+    s = x_int + x_h
+    naf_pos = s & (~x_h)
+    naf_neg = x_h & (~s)
+    return naf_pos, naf_neg
+
+
+def _naf_digit_width(naf_pos, naf_neg):
+    """
+    Return the number of digit positions used by an NAF representation.
+
+    The width is 1 + floor(log2(highest set bit in naf_pos | naf_neg)).
+    For zero inputs the width is 0.
+
+    Args:
+        naf_pos, naf_neg: int32 bitmasks from `_to_naf_components`
+    Returns:
+        width: int32 tensor
+    """
+    combined = naf_pos | naf_neg
+    # bit_length via float log2 (works up to 2^23 with float32)
+    comb_f = combined.float()
+    # floor(log2(x)) + 1  gives bit-length;  0 maps to 0
+    width = torch.where(
+        combined > 0,
+        torch.floor(torch.log2(comb_f)).int() + 1,
+        torch.zeros_like(combined),
+    )
+    return width
+
 
 def _msd_truncate(value, num_digits):
     """
-    Truncate each element to its `num_digits` most significant binary digits.
+    Truncate each element to its `num_digits` most significant BSD (NAF) digits.
 
-    Models the effect of MSD-first computation under a cycle budget:
-    only the top `num_digits` digits of each value survive.
+    Models MSD-first computation under a cycle budget: the hardware streams
+    digits from MSD to LSD in Binary Signed-Digit (BSD) representation.
+    After `num_digits` cycles only those digits survive.
+
+    We use the Non-Adjacent Form (NAF) — the canonical, minimum-weight BSD
+    encoding — as the simulation reference. NAF can shift the MSD position
+    by +1 compared to plain binary (e.g. 7 = 0b111 in binary but 100(-1) in
+    NAF), which makes its truncation behaviour distinct from binary truncation.
 
     Args:
         value: float32 tensor (any shape)
@@ -278,16 +335,40 @@ def _msd_truncate(value, num_digits):
         truncated: float32 tensor, same shape as value
     """
     abs_v = value.abs()
-    # Position of MSB: floor(log2(|v|))
-    msb_pos = torch.floor(torch.log2(abs_v.clamp(min=1e-45)))
-    # Quantum: value of the least significant kept digit
-    # quantum = 2^(msb_pos - num_digits + 1)
-    quantum = torch.pow(2.0, msb_pos - num_digits + 1.0)
-    # Truncate by rounding down to nearest quantum
-    truncated = torch.trunc(value / quantum) * quantum
+    sign = value.sign()
+
+    # Scale to integer mantissa: shift so that MSB sits near bit-22/23.
+    # We use 2^(23 - msb_pos) so the integer has its MSB at bit 23.
+    msb_pos = torch.floor(torch.log2(abs_v.clamp(min=1e-45)))  # float position of MSB
+    scale_up = torch.pow(2.0, 23.0 - msb_pos)  # shift to [2^23, 2^24)
+    x_scaled = torch.round(abs_v * scale_up).to(torch.int32)  # int mantissa
+
+    # Convert to NAF
+    naf_pos, naf_neg = _to_naf_components(x_scaled)
+
+    # NAF digit width (may be 1 more than binary width due to carry)
+    naf_width = _naf_digit_width(naf_pos, naf_neg)  # int32
+
+    # Number of digit positions to ZERO-out from the bottom
+    num_digits_i = num_digits.to(torch.int32) if num_digits.is_floating_point() else num_digits
+    drop = (naf_width - num_digits_i).clamp(min=0)  # int32
+
+    # Build a bit-mask that keeps only the top `num_digits` positions:
+    #   mask_out = (1 << drop) - 1   (bits to clear)
+    #   keep_mask = ~mask_out
+    mask_out = (1 << drop) - 1  # int32: low `drop` bits set
+    keep_mask = ~mask_out
+
+    naf_pos_trunc = naf_pos & keep_mask
+    naf_neg_trunc = naf_neg & keep_mask
+
+    # Reconstruct float value:  result = sign * (pos - neg) / scale_up
+    reconstructed = (naf_pos_trunc.float() - naf_neg_trunc.float()) / scale_up
+    result = sign * reconstructed
+
     # Zero out elements with num_digits <= 0 or value == 0
     mask = (num_digits > 0) & (abs_v > 0)
-    return torch.where(mask, truncated, torch.zeros_like(value))
+    return torch.where(mask, result, torch.zeros_like(value))
 
 
 # ── Deep pipeline helpers ────────────────────────────────────────────────────
@@ -296,8 +377,9 @@ def _msd_silu(x, precision_digits):
     """
     Apply SiLU activation in MSD-simulated mode.
 
-    Applies float SiLU then truncates to model digit-loss from
-    MSD-first nonlinear evaluation (avoids true digit-serial CORDIC SiLU).
+    Applies float SiLU then truncates to `precision_digits` most significant
+    BSD (NAF) digits to model digit-loss from MSD-first nonlinear evaluation
+    (avoids true digit-serial CORDIC SiLU).
 
     Args:
         x: float32 tensor
@@ -311,10 +393,10 @@ def _msd_silu(x, precision_digits):
 
 def _msd_elementwise_mul(a, b, precision_digits):
     """
-    MSD-simulated element-wise multiply.
+    MSD-simulated element-wise multiply with BSD (NAF) truncation.
 
     Product of two P-digit MSD values produces 2P digits, but output
-    stream retains only precision_digits (modeling online delay loss).
+    stream retains only precision_digits BSD digits (modeling online delay loss).
 
     Args:
         a, b: float32 tensors (same shape)
@@ -405,13 +487,19 @@ class _MXFPLinearBase(nn.Module):
         q, scales = self._quantize_to_blocks(blocks)
         return q, scales, pad_len
 
-    def _resolve_channel_budgets(self, compute_context, x_scales, N):
+    def _resolve_channel_budgets(self, compute_context, x_scales, w_scales, N):
         """
-        Resolve per-output-channel cycle budgets using hybrid Glocal budgeting.
+        Resolve per-output-channel cycle budgets using hybrid Glocal budgeting
+        with combined activation + weight scales.
+
+        The dynamic budget adjustment uses the maximum combined log2 scale
+        per (sample, output-channel) pair, which better predicts the magnitude
+        of the channel's dot-product result than activation scale alone.
 
         Args:
             compute_context: MSDComputeContext or None
             x_scales: (N, nb) activation shared scales
+            w_scales: (out, nb) weight shared scales
             N: batch size
         Returns:
             b_final: (N, out) per-sample, per-output-channel final budget
@@ -425,9 +513,13 @@ class _MXFPLinearBase(nn.Module):
                 (self.out_features,), float(cfg.msd_cycle_budget),
                 dtype=torch.float32, device=x_scales.device
             )
-        # Dynamic activation override: E_act = floor(log2(max activation scale per sample))
-        max_x_scale = x_scales.amax(dim=-1)    # (N,)
-        e_act = torch.floor(_safe_log2(max_x_scale))  # (N,)
+        # Combined scale exponent: max across blocks of floor(log2(x_scale * w_scale))
+        # This gives a per-(sample, output-channel) measure of the channel result magnitude.
+        log2_x = _safe_log2(x_scales)   # (N, nb)
+        log2_w = _safe_log2(w_scales)   # (out, nb)
+        combined_log2 = log2_x.unsqueeze(1) + log2_w.unsqueeze(0)  # (N, out, nb)
+        e_combined = torch.floor(combined_log2).amax(dim=-1)  # (N, out)
+        del combined_log2  # free (N, out, nb) immediately
 
         threshold = cfg.msd_budget_dynamic_threshold
         alpha = cfg.msd_budget_dynamic_scale
@@ -435,15 +527,15 @@ class _MXFPLinearBase(nn.Module):
 
         if mode == "step":
             delta_b = torch.where(
-                e_act > threshold,
+                e_combined > threshold,
                 torch.tensor(alpha, dtype=torch.float32, device=x_scales.device),
                 torch.tensor(0.0, dtype=torch.float32, device=x_scales.device),
-            )  # (N,)
+            )  # (N, out)
         else:  # "linear" (default)
-            delta_b = alpha * torch.clamp(e_act - threshold, min=0.0)  # (N,)
+            delta_b = alpha * torch.clamp(e_combined - threshold, min=0.0)  # (N, out)
 
-        # b_final: (N, out) = (1, out) + (N, 1)
-        b_final = b_base.unsqueeze(0) + delta_b.unsqueeze(1)
+        # b_final: (N, out) = (1, out) + (N, out)
+        b_final = b_base.unsqueeze(0) + delta_b
         return b_final
 
     def _forward_msd_truncated(
@@ -478,8 +570,8 @@ class _MXFPLinearBase(nn.Module):
         # 2. Intra-block delays from activation element exponents: (N, nb, bs)
         intra_delays = _compute_intra_block_delays(x_q)
 
-        # 3. Per-channel budget: (N, out)
-        b_final = self._resolve_channel_budgets(compute_context, x_scales, N)
+        # 3. Per-channel budget: (N, out) — uses combined activation + weight scales
+        b_final = self._resolve_channel_budgets(compute_context, x_scales, w_scales, N)
 
         # 4. Element-wise products: (N, out, nb, bs)
         # x_q: (N, nb, bs) -> (N, 1, nb, bs);  w_q: (out, nb, bs) -> (1, out, nb, bs)
