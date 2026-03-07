@@ -94,7 +94,10 @@ def _find_budget_for_snr(
     intermediate tensor ``(N, chunk, nb, bs)`` stays under
     ``_CAL_CHUNK_TARGET_BYTES``.
 
-    Returns: budget tensor of shape (out_features,) on the input device.
+    Returns:
+        (budgets, channel_stats) where:
+        - budgets: tensor of shape (out_features,) on the input device
+        - channel_stats: dict of per-channel statistics tensors (each shape (out,))
     """
     from .modeling_qwen3 import _msd_truncate
 
@@ -181,7 +184,93 @@ def _find_budget_for_snr(
         hi = torch.where(good, mid, hi)
         lo = torch.where(good, lo, mid + 1)
 
-    return hi  # conservative upper bound
+    # ── Phase 3: Collect per-channel statistics at the converged budget ──
+    budgets = hi
+    stats = _collect_channel_stats(
+        budgets, x_q_exp, x_scales_exp, intra_exp,
+        log2_x, log2_w_full, online_delay, chunk_size, out, N,
+    )
+    return budgets, stats
+
+
+def _collect_channel_stats(
+    budgets, x_q_exp, x_scales_exp, intra_exp,
+    log2_x, log2_w_full, online_delay, chunk_size, out, N,
+):
+    """
+    Compute per-channel dynamic range statistics at the converged budget.
+
+    Runs one chunked pass over the output dimension to collect delay and
+    effective-precision statistics without materialising the full (N,out,nb,bs)
+    tensor.
+
+    Returns:
+        dict of stat_name -> list[float] (length = out)
+    """
+    device = budgets.device
+
+    # Accumulators (on GPU, shape (out,))
+    e_combined_sum = torch.zeros(out, dtype=torch.float64, device=device)
+    e_combined_sq  = torch.zeros(out, dtype=torch.float64, device=device)
+    e_combined_max = torch.full((out,), -1e30, dtype=torch.float32, device=device)
+    e_combined_min = torch.full((out,),  1e30, dtype=torch.float32, device=device)
+    inter_delay_sum = torch.zeros(out, dtype=torch.float64, device=device)
+    intra_delay_mean_global = intra_exp.squeeze(1).mean().item()  # scalar, same for all channels
+    eff_prec_sum   = torch.zeros(out, dtype=torch.float64, device=device)
+    eff_prec_min   = torch.full((out,),  1e30, dtype=torch.float32, device=device)
+
+    # intra_exp shape: (N, 1, nb, bs)  — nb and bs from its shape
+    nb = intra_exp.shape[2]
+    bs = intra_exp.shape[3]
+
+    for j0 in range(0, out, chunk_size):
+        j1 = min(j0 + chunk_size, out)
+        b_c = budgets[j0:j1]  # (c,)
+
+        # Combined log2 scale: (N, c, nb)
+        log2_w_c = log2_w_full[j0:j1].unsqueeze(0)       # (1, c, nb)
+        combined_e = torch.floor(log2_x + log2_w_c)       # (N, c, nb)
+        e_max_c = combined_e.amax(dim=-1)                  # (N, c) — per-(sample, channel)
+
+        # e_combined stats per channel (reduce over N)
+        e_combined_sum[j0:j1] = e_max_c.double().sum(dim=0)
+        e_combined_sq[j0:j1]  = (e_max_c.double() ** 2).sum(dim=0)
+        e_combined_max[j0:j1] = torch.maximum(e_combined_max[j0:j1], e_max_c.amax(dim=0))
+        e_combined_min[j0:j1] = torch.minimum(e_combined_min[j0:j1], e_max_c.amin(dim=0))
+
+        # Inter-block delays: (N, c, nb)
+        inter_delays_c = e_max_c.unsqueeze(-1) - combined_e
+        inter_delay_sum[j0:j1] = inter_delays_c.double().mean(dim=(0, 2))  # mean over N, nb
+
+        # Total delay -> effective precision: (N, c, nb, bs)
+        total_delay = inter_delays_c.unsqueeze(-1) + intra_exp + online_delay
+        b_exp = b_c.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)  # (1, c, 1, 1)
+        p_eff = torch.clamp(b_exp - total_delay, min=0.0)
+
+        # Effective precision stats per channel (reduce over N, nb, bs)
+        eff_prec_sum[j0:j1] = p_eff.double().mean(dim=(0, 2, 3))  # mean over N, nb, bs
+        eff_prec_min[j0:j1] = torch.minimum(
+            eff_prec_min[j0:j1],
+            p_eff.amin(dim=(0, 2, 3)),
+        )
+
+        del combined_e, e_max_c, inter_delays_c, total_delay, p_eff
+
+    # Finalize stats
+    e_combined_mean = (e_combined_sum / N).float()
+    e_combined_var  = (e_combined_sq / N - (e_combined_sum / N) ** 2).clamp(min=0.0)
+    e_combined_std  = e_combined_var.sqrt().float()
+
+    return {
+        "e_combined_mean": e_combined_mean.cpu().tolist(),
+        "e_combined_max":  e_combined_max.cpu().tolist(),
+        "e_combined_min":  e_combined_min.cpu().tolist(),
+        "e_combined_std":  e_combined_std.cpu().tolist(),
+        "inter_delay_mean": inter_delay_sum.float().cpu().tolist(),
+        "intra_delay_mean": round(intra_delay_mean_global, 4),
+        "eff_precision_mean": eff_prec_sum.float().cpu().tolist(),
+        "eff_precision_min":  eff_prec_min.cpu().tolist(),
+    }
 
 
 def calibrate_channel_budgets(
@@ -298,6 +387,7 @@ def calibrate_channel_budgets(
 
     # Process collected data to find per-channel budgets
     calibration_result = {}
+    calibration_stats = {}
 
     layer_iter = list(layer_data.items())
     layer_iter = tqdm(
@@ -319,14 +409,15 @@ def calibrate_channel_budgets(
         # Free per-batch copies to reclaim GPU memory before budget search
         data_list.clear()
 
-        # Find budget per channel (GPU, output-chunked)
-        budgets = _find_budget_for_snr(
+        # Find budget per channel + dynamic range stats (GPU, output-chunked)
+        budgets, stats = _find_budget_for_snr(
             all_x_q, all_x_scales, w_q, w_scales,
             online_delay, target_snr_db,
         )
 
         budget_list = budgets.cpu().tolist()
         calibration_result[layer_name] = budget_list
+        calibration_stats[layer_name] = stats
         logger.info(
             f"  {layer_name}: budget range [{min(budget_list):.0f}, {max(budget_list):.0f}], "
             f"mean={budgets.mean():.1f}"
@@ -338,7 +429,7 @@ def calibrate_channel_budgets(
     # Store in config
     config.msd_calibration_data = calibration_result
     logger.info("Calibration complete. Results stored in config.msd_calibration_data")
-    return calibration_result
+    return calibration_result, calibration_stats
 
 
 def apply_calibration_to_config(config, calibration_data):

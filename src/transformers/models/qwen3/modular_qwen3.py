@@ -11,7 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch Qwen3 model."""
+"""PyTorch Qwen3 model.
+
+This is the **reference / modular** implementation.  MSDComputeContext,
+_resolve_channel_budgets, and all MSD/MXFP helpers are kept in sync with
+modeling_qwen3.py.  The key difference is that _forward_msd_truncated here
+uses a simple non-chunked (N, out, nb, bs) allocation, whereas modeling_qwen3.py
+has the production output-chunked version (2 GiB cap) for large models.
+
+Calibration code lives in calibration_msd.py and imports from modeling_qwen3.py.
+"""
 
 import math
 from collections.abc import Callable
