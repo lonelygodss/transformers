@@ -328,47 +328,78 @@ def _msd_truncate(value, num_digits):
     by +1 compared to plain binary (e.g. 7 = 0b111 in binary but 100(-1) in
     NAF), which makes its truncation behaviour distinct from binary truncation.
 
+    Memory note: NAF conversion creates several same-shape intermediates.  We
+    inline the helper calls and `del` every tensor as soon as it is no longer
+    needed to minimise peak GPU allocation.  The whole function runs under
+    ``torch.no_grad()`` to prevent autograd from retaining the graph.
+
     Args:
         value: float32 tensor (any shape)
         num_digits: float32 tensor (same shape or broadcastable), effective precision
     Returns:
         truncated: float32 tensor, same shape as value
     """
-    abs_v = value.abs()
-    sign = value.sign()
+    with torch.no_grad():
+        abs_v = value.abs()
+        sign = value.sign()
 
-    # Scale to integer mantissa: shift so that MSB sits near bit-22/23.
-    # We use 2^(23 - msb_pos) so the integer has its MSB at bit 23.
-    msb_pos = torch.floor(torch.log2(abs_v.clamp(min=1e-45)))  # float position of MSB
-    scale_up = torch.pow(2.0, 23.0 - msb_pos)  # shift to [2^23, 2^24)
-    x_scaled = torch.round(abs_v * scale_up).to(torch.int32)  # int mantissa
+        # Compute the zero-output mask early; abs_v still needed for scaling below.
+        mask = (num_digits > 0) & (abs_v > 0)
 
-    # Convert to NAF
-    naf_pos, naf_neg = _to_naf_components(x_scaled)
+        # Scale to integer mantissa: shift so that MSB sits near bit-22/23.
+        # We use 2^(23 - msb_pos) so the integer has its MSB at bit 23.
+        msb_pos = torch.floor(torch.log2(abs_v.clamp(min=1e-45)))  # float position of MSB
+        scale_up = torch.pow(2.0, 23.0 - msb_pos)  # shift to [2^23, 2^24)
+        del msb_pos
+        x_scaled = torch.round(abs_v * scale_up).to(torch.int32)  # int mantissa
+        del abs_v
 
-    # NAF digit width (may be 1 more than binary width due to carry)
-    naf_width = _naf_digit_width(naf_pos, naf_neg)  # int32
+        # ── Inline _to_naf_components with early frees ──────────────────────
+        # Identity: x_h = x >> 1;  s = x + x_h
+        #   naf_pos = s & ~x_h   (+1 digit positions)
+        #   naf_neg = x_h & ~s   (-1 digit positions)
+        x_h = x_scaled >> 1
+        s = x_scaled + x_h          # x_scaled still needed for s
+        del x_scaled
+        naf_pos = s & (~x_h)
+        naf_neg = x_h & (~s)
+        del x_h, s
+        # ────────────────────────────────────────────────────────────────────
 
-    # Number of digit positions to ZERO-out from the bottom
-    num_digits_i = num_digits.to(torch.int32) if num_digits.is_floating_point() else num_digits
-    drop = (naf_width - num_digits_i).clamp(min=0)  # int32
+        # ── Inline _naf_digit_width with early frees ─────────────────────
+        combined = naf_pos | naf_neg
+        comb_f = combined.float()
+        naf_width = torch.where(
+            combined > 0,
+            torch.floor(torch.log2(comb_f)).int() + 1,
+            torch.zeros_like(combined),
+        )
+        del combined, comb_f
+        # ────────────────────────────────────────────────────────────────────
 
-    # Build a bit-mask that keeps only the top `num_digits` positions:
-    #   mask_out = (1 << drop) - 1   (bits to clear)
-    #   keep_mask = ~mask_out
-    mask_out = (1 << drop) - 1  # int32: low `drop` bits set
-    keep_mask = ~mask_out
+        # Number of digit positions to ZERO-out from the bottom
+        num_digits_i = num_digits.to(torch.int32) if num_digits.is_floating_point() else num_digits
+        drop = (naf_width - num_digits_i).clamp(min=0)  # int32
+        del naf_width, num_digits_i
 
-    naf_pos_trunc = naf_pos & keep_mask
-    naf_neg_trunc = naf_neg & keep_mask
+        # Build a bit-mask that keeps only the top `num_digits` positions:
+        #   mask_out = (1 << drop) - 1   (bits to clear)
+        #   keep_mask = ~mask_out
+        keep_mask = ~((1 << drop) - 1)  # int32
+        del drop
 
-    # Reconstruct float value:  result = sign * (pos - neg) / scale_up
-    reconstructed = (naf_pos_trunc.float() - naf_neg_trunc.float()) / scale_up
-    result = sign * reconstructed
+        naf_pos_trunc = naf_pos & keep_mask
+        naf_neg_trunc = naf_neg & keep_mask
+        del naf_pos, naf_neg, keep_mask
 
-    # Zero out elements with num_digits <= 0 or value == 0
-    mask = (num_digits > 0) & (abs_v > 0)
-    return torch.where(mask, result, torch.zeros_like(value))
+        # Reconstruct float value:  result = sign * (pos - neg) / scale_up
+        reconstructed = (naf_pos_trunc.float() - naf_neg_trunc.float()) / scale_up
+        del naf_pos_trunc, naf_neg_trunc, scale_up
+        result = sign * reconstructed
+        del sign, reconstructed
+
+        # Zero out elements with num_digits <= 0 or value == 0
+        return torch.where(mask, result, torch.zeros_like(result))
 
 
 # ── Deep pipeline helpers ────────────────────────────────────────────────────

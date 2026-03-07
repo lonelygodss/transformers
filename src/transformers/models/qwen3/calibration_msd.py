@@ -49,7 +49,7 @@ logger = logging.get_logger(__name__)
 # Peak 4D intermediate tensor budget (bytes).  Matches _MSD_CHUNK_TARGET_BYTES
 # in modeling_qwen3.py.  With float32 elements of size 4, a chunk of `c`
 # output channels produces tensors of shape (N, c, nb, bs) = c * N * nb * bs * 4.
-_CAL_CHUNK_TARGET_BYTES: int = 2 * 1024**3  # 2 GiB
+_CAL_CHUNK_TARGET_BYTES: int = 256 * 1024**2  # 256 MiB — keeps _msd_truncate peak within ~1 GiB
 
 
 def _safe_log2_cal(x):
