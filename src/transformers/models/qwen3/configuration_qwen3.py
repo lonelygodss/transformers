@@ -181,7 +181,7 @@ class Qwen3Config(PreTrainedConfig):
         use_msd_truncation: bool | None = False,
         msd_cycle_budget: int | None = 16,
         msd_online_delay: int | None = 2,
-        msd_budget_dynamic_scale: float | None = 1.0,
+        msd_budget_dynamic_scale: float | None = 0.0,
         msd_budget_dynamic_threshold: float | None = 0.0,
         msd_budget_dynamic_mode: str | None = "linear",
         msd_deep_pipeline: bool | None = False,
