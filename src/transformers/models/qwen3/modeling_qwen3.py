@@ -49,6 +49,7 @@ from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
 from ...utils.generic import maybe_autocast, merge_with_config_defaults
 from ...utils.output_capturing import capture_outputs
 from .configuration_qwen3 import Qwen3Config
+from .msd_perf_stats import MSDPerfAccumulator
 
 
 # ── MSD Compute Context ──────────────────────────────────────────────────────
@@ -77,6 +78,7 @@ class MSDComputeContext:
         self.budget_dynamic_mode = config.msd_budget_dynamic_mode
         self.online_delay = config.msd_online_delay
         self.pipeline_precision_loss = config.msd_pipeline_precision_loss
+        self.perf_stats = MSDPerfAccumulator()
 
     @staticmethod
     def activate(ctx):
@@ -521,6 +523,12 @@ class _MXFPLinearBase(nn.Module):
             p_eff = b_final_c.unsqueeze(-1).unsqueeze(-1) - total_delay
             p_eff = torch.clamp(p_eff, min=0.0)
             del total_delay  # free 4D tensor early
+
+            # 4b. Record performance statistics (lightweight — no new large tensors)
+            if compute_context is not None and compute_context.perf_stats is not None:
+                compute_context.perf_stats.record_chunk(
+                    self.layer_name, p_eff, b_final_c, j0, j1, N, nb, bs,
+                )
 
             # 5. Truncate products (BSD/NAF truncation)
             prods_trunc = _msd_truncate(prods, p_eff)
@@ -1402,6 +1410,17 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             self._msd_context = MSDComputeContext.create_from_config(cfg, self.model)
             self._msd_context_config_hash = cfg_hash
         return self._msd_context
+
+    def get_perf_stats(self) -> dict | None:
+        """Return finalized MSD performance statistics, or None if MSD is not active."""
+        if self._msd_context is not None and self._msd_context.perf_stats.has_data:
+            return self._msd_context.perf_stats.finalize()
+        return None
+
+    def reset_perf_stats(self):
+        """Clear accumulated MSD performance statistics."""
+        if self._msd_context is not None:
+            self._msd_context.perf_stats.reset()
 
 
 class Qwen3ForSequenceClassification(GenericForSequenceClassification, Qwen3PreTrainedModel):

@@ -184,11 +184,47 @@ def _find_budget_for_snr(
         hi = torch.where(good, mid, hi)
         lo = torch.where(good, lo, mid + 1)
 
-    # ── Phase 3: Collect per-channel statistics at the converged budget ──
+    # ── Phase 3: Compute SNR & signal power at the converged budget ──
     budgets = hi
+
+    # One final truncated forward pass at the converged budget to get actual SNR
+    result_trunc_final = torch.zeros(N, out, dtype=torch.float32, device=device)
+    for j0 in range(0, out, chunk_size):
+        j1 = min(j0 + chunk_size, out)
+        w_q_c = w_q[j0:j1]
+        w_scales_c = w_scales[j0:j1]
+        b_c = budgets[j0:j1]  # (c,)
+
+        log2_w_c = log2_w_full[j0:j1].unsqueeze(0)
+        combined_e = torch.floor(log2_x + log2_w_c)
+        e_max_c = combined_e.amax(dim=-1)
+        inter_delays_c = e_max_c.unsqueeze(-1) - combined_e
+
+        prods = x_q_exp * w_q_c.unsqueeze(0)
+        total_delay = inter_delays_c.unsqueeze(-1) + intra_exp + online_delay
+        b_exp = b_c.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+        p_eff = torch.clamp(b_exp - total_delay, min=0.0)
+        del total_delay
+
+        prods_trunc = _msd_truncate(prods, p_eff)
+        del prods, p_eff
+        block_dots = prods_trunc.sum(dim=-1)
+        del prods_trunc
+        combined_scales = x_scales_exp * w_scales_c.unsqueeze(0)
+        result_trunc_final[:, j0:j1] = (block_dots * combined_scales).sum(dim=-1)
+        del block_dots, combined_scales, inter_delays_c
+
+    noise_power_final = ((exact_result - result_trunc_final) ** 2).mean(dim=0) + 1e-30
+    snr_at_budget = 10.0 * torch.log10(signal_power / noise_power_final)  # (out,)
+    signal_power_db = 10.0 * torch.log10(signal_power.clamp(min=1e-30))   # (out,)
+    del result_trunc_final, noise_power_final
+
+    # ── Phase 4: Collect per-channel statistics at the converged budget ──
     stats = _collect_channel_stats(
         budgets, x_q_exp, x_scales_exp, intra_exp,
         log2_x, log2_w_full, online_delay, chunk_size, out, N,
+        snr_at_budget=snr_at_budget,
+        signal_power_db=signal_power_db,
     )
     return budgets, stats
 
@@ -196,6 +232,9 @@ def _find_budget_for_snr(
 def _collect_channel_stats(
     budgets, x_q_exp, x_scales_exp, intra_exp,
     log2_x, log2_w_full, online_delay, chunk_size, out, N,
+    *,
+    snr_at_budget=None,
+    signal_power_db=None,
 ):
     """
     Compute per-channel dynamic range statistics at the converged budget.
@@ -204,8 +243,24 @@ def _collect_channel_stats(
     effective-precision statistics without materialising the full (N,out,nb,bs)
     tensor.
 
+    Statistics are partitioned into two groups:
+
+    **Budget-independent** (intrinsic to the data, useful for understanding
+    weight/activation dynamic range regardless of how B_base was chosen):
+        - e_combined_mean/max/min/std — combined log2 scale per channel
+        - inter_delay_mean — average inter-block alignment delay
+        - intra_delay_mean — average intra-block element delay (scalar)
+        - signal_power_db — 10·log10(mean(exact_dot²)) per channel
+        - snr_at_budget — actual SNR (dB) achieved at converged budget
+          (validates that target_snr_db is met; computed externally but
+          stored here for convenience)
+
+    **Budget-dependent** (characterize the converged budget B_base):
+        - eff_precision_mean — mean effective precision = B − total_delay
+        - eff_precision_min — worst-case effective precision
+
     Returns:
-        dict of stat_name -> list[float] (length = out)
+        dict of stat_name -> list[float] (length = out) or scalar
     """
     device = budgets.device
 
@@ -261,16 +316,24 @@ def _collect_channel_stats(
     e_combined_var  = (e_combined_sq / N - (e_combined_sum / N) ** 2).clamp(min=0.0)
     e_combined_std  = e_combined_var.sqrt().float()
 
-    return {
+    result = {
+        # Budget-independent stats
         "e_combined_mean": e_combined_mean.cpu().tolist(),
         "e_combined_max":  e_combined_max.cpu().tolist(),
         "e_combined_min":  e_combined_min.cpu().tolist(),
         "e_combined_std":  e_combined_std.cpu().tolist(),
         "inter_delay_mean": inter_delay_sum.float().cpu().tolist(),
         "intra_delay_mean": round(intra_delay_mean_global, 4),
+        # Budget-dependent stats
         "eff_precision_mean": eff_prec_sum.float().cpu().tolist(),
         "eff_precision_min":  eff_prec_min.cpu().tolist(),
     }
+    # Validation metrics (computed externally, passed in)
+    if snr_at_budget is not None:
+        result["snr_at_budget"] = snr_at_budget.cpu().tolist()
+    if signal_power_db is not None:
+        result["signal_power_db"] = signal_power_db.cpu().tolist()
+    return result
 
 
 def calibrate_channel_budgets(
