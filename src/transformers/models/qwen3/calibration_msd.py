@@ -85,6 +85,7 @@ def _find_budget_for_snr(
     online_delay,
     target_snr_db=30.0,
     budget_range=(4, 48),
+    collect_channel_detail=False,
 ):
     """
     Output-chunked binary search for per-channel budget B_base meeting target SNR.
@@ -94,10 +95,17 @@ def _find_budget_for_snr(
     intermediate tensor ``(N, chunk, nb, bs)`` stays under
     ``_CAL_CHUNK_TARGET_BYTES``.
 
+    Args:
+        collect_channel_detail: if True, return full per-channel detail arrays
+            in addition to the layer summary.  When False (default), only
+            the compact layer summary is returned (much smaller JSON).
+
     Returns:
-        (budgets, channel_stats) where:
+        (budgets, layer_summary, channel_detail) where:
         - budgets: tensor of shape (out_features,) on the input device
-        - channel_stats: dict of per-channel statistics tensors (each shape (out,))
+        - layer_summary: dict of scalar summary statistics for this layer
+        - channel_detail: dict of per-channel lists (only populated when
+          collect_channel_detail=True, else empty dict)
     """
     from .modeling_qwen3 import _msd_truncate
 
@@ -219,14 +227,16 @@ def _find_budget_for_snr(
     signal_power_db = 10.0 * torch.log10(signal_power.clamp(min=1e-30))   # (out,)
     del result_trunc_final, noise_power_final
 
-    # ── Phase 4: Collect per-channel statistics at the converged budget ──
-    stats = _collect_channel_stats(
+    # ── Phase 4: Collect statistics at the converged budget ──
+    layer_summary, channel_detail = _collect_channel_stats(
         budgets, x_q_exp, x_scales_exp, intra_exp,
         log2_x, log2_w_full, online_delay, chunk_size, out, N,
         snr_at_budget=snr_at_budget,
         signal_power_db=signal_power_db,
+        collect_channel_detail=collect_channel_detail,
+        budget_range=budget_range,
     )
-    return budgets, stats
+    return budgets, layer_summary, channel_detail
 
 
 def _collect_channel_stats(
@@ -235,32 +245,21 @@ def _collect_channel_stats(
     *,
     snr_at_budget=None,
     signal_power_db=None,
+    collect_channel_detail=False,
+    budget_range=(4, 48),
 ):
     """
-    Compute per-channel dynamic range statistics at the converged budget.
+    Compute layer-wise summary statistics and optionally per-channel detail.
 
     Runs one chunked pass over the output dimension to collect delay and
     effective-precision statistics without materialising the full (N,out,nb,bs)
     tensor.
 
-    Statistics are partitioned into two groups:
-
-    **Budget-independent** (intrinsic to the data, useful for understanding
-    weight/activation dynamic range regardless of how B_base was chosen):
-        - e_combined_mean/max/min/std — combined log2 scale per channel
-        - inter_delay_mean — average inter-block alignment delay
-        - intra_delay_mean — average intra-block element delay (scalar)
-        - signal_power_db — 10·log10(mean(exact_dot²)) per channel
-        - snr_at_budget — actual SNR (dB) achieved at converged budget
-          (validates that target_snr_db is met; computed externally but
-          stored here for convenience)
-
-    **Budget-dependent** (characterize the converged budget B_base):
-        - eff_precision_mean — mean effective precision = B − total_delay
-        - eff_precision_min — worst-case effective precision
-
     Returns:
-        dict of stat_name -> list[float] (length = out) or scalar
+        (layer_summary, channel_detail) where:
+        - layer_summary: dict of scalar/small-structure summary statistics
+        - channel_detail: dict of per-channel lists (empty dict if
+          collect_channel_detail is False)
     """
     device = budgets.device
 
@@ -311,29 +310,81 @@ def _collect_channel_stats(
 
         del combined_e, e_max_c, inter_delays_c, total_delay, p_eff
 
-    # Finalize stats
+    # ── Finalize per-channel tensors (on GPU) ──
     e_combined_mean = (e_combined_sum / N).float()
     e_combined_var  = (e_combined_sq / N - (e_combined_sum / N) ** 2).clamp(min=0.0)
     e_combined_std  = e_combined_var.sqrt().float()
+    inter_delay_mean = inter_delay_sum.float()
+    eff_precision_mean = eff_prec_sum.float()
 
-    result = {
-        # Budget-independent stats
-        "e_combined_mean": e_combined_mean.cpu().tolist(),
-        "e_combined_max":  e_combined_max.cpu().tolist(),
-        "e_combined_min":  e_combined_min.cpu().tolist(),
-        "e_combined_std":  e_combined_std.cpu().tolist(),
-        "inter_delay_mean": inter_delay_sum.float().cpu().tolist(),
+    # Move to CPU for aggregation
+    budgets_cpu = budgets.cpu()
+    e_combined_mean_cpu = e_combined_mean.cpu()
+    e_combined_std_cpu = e_combined_std.cpu()
+    e_combined_max_cpu = e_combined_max.cpu()
+    e_combined_min_cpu = e_combined_min.cpu()
+    inter_delay_mean_cpu = inter_delay_mean.cpu()
+    eff_precision_mean_cpu = eff_precision_mean.cpu()
+    eff_prec_min_cpu = eff_prec_min.cpu()
+    snr_cpu = snr_at_budget.cpu() if snr_at_budget is not None else None
+    signal_power_cpu = signal_power_db.cpu() if signal_power_db is not None else None
+
+    # ── Build compact layer summary (always) ──
+    b_min, b_max = float(budgets_cpu.min()), float(budgets_cpu.max())
+    budget_hist = {}
+    for val in budgets_cpu.tolist():
+        key = str(int(val))
+        budget_hist[key] = budget_hist.get(key, 0) + 1
+
+    sorted_b = budgets_cpu.sort().values
+    n_ch = len(sorted_b)
+
+    layer_summary = {
+        # Budget distribution
+        "budget_mean": round(float(budgets_cpu.mean()), 2),
+        "budget_min": b_min,
+        "budget_max": b_max,
+        "budget_std": round(float(budgets_cpu.std()), 2) if n_ch > 1 else 0.0,
+        "budget_p25": float(sorted_b[n_ch // 4]),
+        "budget_p50": float(sorted_b[n_ch // 2]),
+        "budget_p75": float(sorted_b[3 * n_ch // 4]),
+        "budget_histogram": budget_hist,
+        "frac_at_min_budget": round(float((budgets_cpu == budget_range[0]).sum()) / n_ch, 4),
+        "frac_at_max_budget": round(float((budgets_cpu == budget_range[1]).sum()) / n_ch, 4),
+        # SNR validation
+        "snr_mean": round(float(snr_cpu.mean()), 2) if snr_cpu is not None else None,
+        "snr_min": round(float(snr_cpu.min()), 2) if snr_cpu is not None else None,
+        # Combined exponent
+        "e_combined_mean": round(float(e_combined_mean_cpu.mean()), 2),
+        "e_combined_std": round(float(e_combined_std_cpu.mean()), 2),
+        "e_combined_range": [round(float(e_combined_min_cpu.min()), 2),
+                             round(float(e_combined_max_cpu.max()), 2)],
+        # Delays
+        "inter_delay_mean": round(float(inter_delay_mean_cpu.mean()), 4),
         "intra_delay_mean": round(intra_delay_mean_global, 4),
-        # Budget-dependent stats
-        "eff_precision_mean": eff_prec_sum.float().cpu().tolist(),
-        "eff_precision_min":  eff_prec_min.cpu().tolist(),
+        # Effective precision
+        "eff_precision_mean": round(float(eff_precision_mean_cpu.mean()), 2),
+        "eff_precision_min": round(float(eff_prec_min_cpu.min()), 2),
+        # Signal power
+        "signal_power_db_mean": round(float(signal_power_cpu.mean()), 2) if signal_power_cpu is not None else None,
+        "signal_power_db_range": [round(float(signal_power_cpu.min()), 2),
+                                  round(float(signal_power_cpu.max()), 2)] if signal_power_cpu is not None else None,
     }
-    # Validation metrics (computed externally, passed in)
-    if snr_at_budget is not None:
-        result["snr_at_budget"] = snr_at_budget.cpu().tolist()
-    if signal_power_db is not None:
-        result["signal_power_db"] = signal_power_db.cpu().tolist()
-    return result
+
+    # ── Build per-channel detail (only when requested) ──
+    channel_detail = {}
+    if collect_channel_detail:
+        channel_detail = {
+            "budget": budgets_cpu.tolist(),
+            "snr_at_budget": snr_cpu.tolist() if snr_cpu is not None else [],
+            "e_combined_mean": e_combined_mean_cpu.tolist(),
+            "e_combined_std": e_combined_std_cpu.tolist(),
+            "inter_delay_mean": inter_delay_mean_cpu.tolist(),
+            "eff_precision_mean": eff_precision_mean_cpu.tolist(),
+            "signal_power_db": signal_power_cpu.tolist() if signal_power_cpu is not None else [],
+        }
+
+    return layer_summary, channel_detail
 
 
 def calibrate_channel_budgets(
@@ -346,6 +397,7 @@ def calibrate_channel_budgets(
     online_delay=None,
     show_progress=False,
     progress_prefix="",
+    detail_layer=2,
 ):
     """
     Run calibration to determine per-channel MSD cycle budgets.
@@ -367,12 +419,20 @@ def calibrate_channel_budgets(
         online_delay: MSD online delay (default: from config)
         show_progress: whether to show tqdm progress bars
         progress_prefix: prefix string for tqdm descriptions (e.g. rank tag)
+        detail_layer: transformer layer index for which full per-channel
+            statistics are collected (default: 2).  Layers matching
+            ``model.layers.<detail_layer>.`` get channel-wise detail;
+            all other layers only get compact layer summaries.
 
     Side Effects:
         Sets model.config.msd_calibration_data with per-layer per-channel budgets.
 
     Returns:
-        dict mapping layer names to lists of per-channel budget values.
+        (calibration_result, layer_summaries, channel_details) where:
+        - calibration_result: dict[layer_name -> list[float]] per-channel budgets
+        - layer_summaries: dict[layer_name -> dict] compact summary per layer
+        - channel_details: dict[layer_name -> dict] per-channel detail (only
+          for layers matching detail_layer)
     """
     # Avoid circular import at module level
     from .modeling_qwen3 import _MXFPLinearBase
@@ -448,9 +508,13 @@ def calibrate_channel_budgets(
         for h in hooks:
             h.remove()
 
+    # Determine which layers get full channel-level detail
+    detail_prefix = f"model.layers.{detail_layer}."
+
     # Process collected data to find per-channel budgets
     calibration_result = {}
-    calibration_stats = {}
+    layer_summaries = {}
+    channel_details = {}
 
     layer_iter = list(layer_data.items())
     layer_iter = tqdm(
@@ -472,15 +536,22 @@ def calibrate_channel_budgets(
         # Free per-batch copies to reclaim GPU memory before budget search
         data_list.clear()
 
-        # Find budget per channel + dynamic range stats (GPU, output-chunked)
-        budgets, stats = _find_budget_for_snr(
+        # Decide whether this layer gets channel-level detail
+        want_detail = detail_prefix in layer_name
+
+        # Find budget per channel + stats (GPU, output-chunked)
+        budgets, layer_summary, channel_detail = _find_budget_for_snr(
             all_x_q, all_x_scales, w_q, w_scales,
             online_delay, target_snr_db,
+            collect_channel_detail=want_detail,
         )
 
         budget_list = budgets.cpu().tolist()
         calibration_result[layer_name] = budget_list
-        calibration_stats[layer_name] = stats
+        layer_summaries[layer_name] = layer_summary
+        if channel_detail:
+            channel_details[layer_name] = channel_detail
+
         logger.info(
             f"  {layer_name}: budget range [{min(budget_list):.0f}, {max(budget_list):.0f}], "
             f"mean={budgets.mean():.1f}"
@@ -492,7 +563,7 @@ def calibrate_channel_budgets(
     # Store in config
     config.msd_calibration_data = calibration_result
     logger.info("Calibration complete. Results stored in config.msd_calibration_data")
-    return calibration_result, calibration_stats
+    return calibration_result, layer_summaries, channel_details
 
 
 def apply_calibration_to_config(config, calibration_data):
