@@ -21,11 +21,28 @@ covering four hierarchy levels:
     Bit level    — effective precision (p_eff) distribution per element
     Block level  — zero / partial / full block activation counts
     Channel level — total cycles consumed vs budget, utilization ratio
-    Global       — model-wide sparsity ratios, total vs effective MACs
+    MAC level    — total / active / skipped multiply-accumulate operations
 
 These statistics reflect *actual runtime behaviour* during inference (not
 calibration-time properties).  They are designed to feed future hardware
 simulation: latency = f(cycle counts), energy = f(sparsity, utilization).
+
+Output structure (from ``finalize``):
+
+    {
+        "global": { ... model-wide aggregates ... },
+        "per_layer": {
+            "<layer_name>": {
+                "summary": { bit_level, block_level, channel_level, mac_level },
+                "channel_detail": { ... }   # only for detail_layer layers
+            }
+        }
+    }
+
+Layer summaries are compact scalar/small-structure dicts produced for every
+layer.  Per-channel detail arrays (one entry per output channel) are only
+emitted for layers belonging to the transformer layer index specified by
+``detail_layer`` (default 2), matching the pattern used in calibration.
 
 Usage:
     Automatically active when MSD truncation is enabled.  The accumulator
@@ -52,7 +69,7 @@ class _LayerAccumulator:
     Per-layer accumulator for hierarchical MSD performance statistics.
 
     All tensors are 1D of shape (out_features,) or (out_features, num_bins),
-    stored in float64 for numerical stability across many forward passes.
+    stored in float64/int64 for numerical stability across many forward passes.
     """
 
     def __init__(self, out_features: int, device: torch.device):
@@ -64,24 +81,30 @@ class _LayerAccumulator:
         self.p_eff_sq_sum = torch.zeros(out_features, dtype=torch.float64, device=device)
         self.p_eff_hist = torch.zeros(out_features, _NUM_BINS, dtype=torch.int64, device=device)
 
+        # ── Bit level (active-only): conditional p_eff for elements where p_eff > 0 ──
+        self.active_p_eff_sum = torch.zeros(out_features, dtype=torch.float64, device=device)
+        self.active_element_count = torch.zeros(out_features, dtype=torch.int64, device=device)
+
         # ── Block level: activation categories ──
-        # An "element" here is one (n, j, b, k) product entry.
-        # zero:    p_eff == 0 (fully skipped, no computation)
-        # partial: 0 < p_eff < naf_width of the product (truncated)
-        # full:    p_eff >= naf_width (all BSD digits computed)
-        # For simplicity, we use p_eff == 0 as zero, p_eff > 0 as "active".
         # At block granularity: a block (n,j,b) is "zero" if ALL bs elements
         # in it have p_eff == 0; "full" if ALL have p_eff > 0; else "partial".
         self.block_zero_count = torch.zeros(out_features, dtype=torch.int64, device=device)
         self.block_partial_count = torch.zeros(out_features, dtype=torch.int64, device=device)
         self.block_full_count = torch.zeros(out_features, dtype=torch.int64, device=device)
 
+        # ── Block level (partial-block detail): active element count within partial blocks ──
+        # Used to compute mean active fraction within partial blocks.
+        self.partial_block_active_elem_sum = torch.zeros(out_features, dtype=torch.int64, device=device)
+
         # ── Channel level: cycle accounting ──
         # total_budget_cycles = sum of b_final[n,j] across all N samples
         # effective_cycles = sum of p_eff across all elements (total "work done")
-        # skipped_cycles = total_budget_cycles * nb * bs - effective_cycles
         self.total_budget_sum = torch.zeros(out_features, dtype=torch.float64, device=device)
         self.effective_cycles_sum = torch.zeros(out_features, dtype=torch.float64, device=device)
+
+        # ── MAC level: element-wise sparsity ──
+        # zero_element_count = number of elements with p_eff == 0 (fully skipped MACs)
+        self.zero_element_count = torch.zeros(out_features, dtype=torch.int64, device=device)
 
         # ── Counting ──
         self.total_elements = torch.zeros(out_features, dtype=torch.int64, device=device)
@@ -98,7 +121,8 @@ class MSDPerfAccumulator:
         Bit level    — p_eff distribution (mean, std, histogram)
         Block level  — zero / partial / full block activation counts
         Channel level — total cycles consumed, effective cycles, utilization
-        Global       — model-wide aggregates (sparsity, mean precision)
+        MAC level    — total / active / skipped MACs, sparsity ratio
+        Global       — model-wide aggregates across all layers
 
     Thread-safety: NOT thread-safe (same as MSDComputeContext — one per process).
     """
@@ -148,67 +172,71 @@ class MSDPerfAccumulator:
             bs: block size
         """
         c = j1 - j0
-        out_total = j1 if j0 == 0 else None  # we'll need the full out from the accumulator
         device = p_eff.device
 
-        # Lazily determine full output size from the first chunk that creates the accumulator.
-        # Subsequent chunks contribute to the same accumulator via slice indexing.
-        # We defer full-out discovery: the accumulator is created with max(j1) seen.
+        # Lazily determine full output size from the first chunk.
         acc = self._layers.get(layer_name)
         if acc is None:
-            # We don't know full out_features yet from just a chunk.
-            # Use a generous initial size; _ensure_size will grow if needed.
-            # Actually, we'll set it properly when finalize is called.
-            # For now, we pre-allocate for the maximum j1 we've seen.
             acc = _LayerAccumulator(j1, device)
             self._layers[layer_name] = acc
         elif j1 > acc.out:
-            # Grow accumulator (rare — only if chunks arrive out of order or
-            # first chunk didn't cover full output)
             acc = self._grow_accumulator(layer_name, j1, device)
 
         # ── Bit level ──
-        # p_eff: (N, c, nb, bs) — reduce to per-channel stats
         p_flat = p_eff.reshape(N, c, nb * bs)  # (N, c, nb*bs)
-        channel_p_mean = p_flat.double().sum(dim=(0, 2))  # (c,) sum over N and elements
-        channel_p_sq = (p_flat.double() ** 2).sum(dim=(0, 2))  # (c,)
-        acc.p_eff_sum[j0:j1] += channel_p_mean
+        p_flat_d = p_flat.double()
+        channel_p_sum = p_flat_d.sum(dim=(0, 2))  # (c,)
+        channel_p_sq = (p_flat_d ** 2).sum(dim=(0, 2))  # (c,)
+        acc.p_eff_sum[j0:j1] += channel_p_sum
         acc.p_eff_sq_sum[j0:j1] += channel_p_sq
 
         # Histogram: bucketize p_eff into bins, count per channel
         bin_edges = self._get_bin_edges(device)
-        bin_idx = torch.bucketize(p_eff.float(), bin_edges)  # (N, c, nb, bs), values in [0, _NUM_BINS-1]
+        bin_idx = torch.bucketize(p_eff.float(), bin_edges)  # (N, c, nb, bs)
         bin_idx_flat = bin_idx.reshape(N * c, nb * bs)
-        # Count per (channel_within_chunk) per bin
         for bi in range(_NUM_BINS):
             counts = (bin_idx_flat == bi).sum(dim=-1).reshape(N, c).sum(dim=0)  # (c,)
             acc.p_eff_hist[j0:j1, bi] += counts.long()
         del bin_idx, bin_idx_flat
 
+        # ── Bit level (active-only) ──
+        active_mask = p_flat > 0  # (N, c, nb*bs)
+        active_count_per_ch = active_mask.sum(dim=(0, 2))  # (c,)
+        acc.active_element_count[j0:j1] += active_count_per_ch.long()
+        acc.active_p_eff_sum[j0:j1] += (p_flat_d * active_mask).sum(dim=(0, 2))
+        del active_mask
+
+        # ── MAC level (element sparsity) ──
+        zero_count = (p_flat == 0).sum(dim=(0, 2))  # (c,)
+        acc.zero_element_count[j0:j1] += zero_count.long()
+
         # ── Block level ──
-        # Per block (n, j, b): check if all bs elements are zero or all active
         p_block = p_eff.reshape(N, c, nb, bs)
-        block_active_count = (p_block > 0).sum(dim=-1)  # (N, c, nb) — num active elements per block
-        block_is_zero = (block_active_count == 0)        # all elements skipped
-        block_is_full = (block_active_count == bs)        # all elements computed
+        block_active_count = (p_block > 0).sum(dim=-1)  # (N, c, nb)
+        block_is_zero = (block_active_count == 0)
+        block_is_full = (block_active_count == bs)
         block_is_partial = ~block_is_zero & ~block_is_full
 
-        acc.block_zero_count[j0:j1] += block_is_zero.sum(dim=(0, 2)).long()     # (c,)
-        acc.block_full_count[j0:j1] += block_is_full.sum(dim=(0, 2)).long()     # (c,)
-        acc.block_partial_count[j0:j1] += block_is_partial.sum(dim=(0, 2)).long()  # (c,)
-        del block_active_count, block_is_zero, block_is_full, block_is_partial
+        acc.block_zero_count[j0:j1] += block_is_zero.sum(dim=(0, 2)).long()
+        acc.block_full_count[j0:j1] += block_is_full.sum(dim=(0, 2)).long()
+        acc.block_partial_count[j0:j1] += block_is_partial.sum(dim=(0, 2)).long()
+
+        # Active elements within partial blocks (for mean active fraction)
+        partial_active = block_active_count * block_is_partial  # zero out non-partial
+        acc.partial_block_active_elem_sum[j0:j1] += partial_active.sum(dim=(0, 2)).long()
+        del block_active_count, block_is_zero, block_is_full, block_is_partial, partial_active
 
         # ── Channel level ──
-        # b_final_c: (N, c) — total budget cycles allocated to each channel
         acc.total_budget_sum[j0:j1] += b_final_c.double().sum(dim=0)
-        # effective_cycles: sum of p_eff across all nb*bs elements per channel
-        acc.effective_cycles_sum[j0:j1] += p_flat.double().sum(dim=(0, 2))
+        acc.effective_cycles_sum[j0:j1] += p_flat_d.sum(dim=(0, 2))
 
         # ── Counting ──
         n_elements = N * nb * bs
         acc.total_elements[j0:j1] += n_elements
         acc.total_blocks[j0:j1] += N * nb
-        acc.num_samples += N  # Note: accumulated per-chunk, will divide later
+        acc.num_samples += N
+
+        del p_flat_d
 
     def _grow_accumulator(self, layer_name: str, new_out: int, device: torch.device) -> _LayerAccumulator:
         """Grow an existing accumulator to accommodate more output channels."""
@@ -219,150 +247,105 @@ class MSDPerfAccumulator:
         new_acc.p_eff_sum[:o] = old.p_eff_sum
         new_acc.p_eff_sq_sum[:o] = old.p_eff_sq_sum
         new_acc.p_eff_hist[:o] = old.p_eff_hist
+        new_acc.active_p_eff_sum[:o] = old.active_p_eff_sum
+        new_acc.active_element_count[:o] = old.active_element_count
         new_acc.block_zero_count[:o] = old.block_zero_count
         new_acc.block_partial_count[:o] = old.block_partial_count
         new_acc.block_full_count[:o] = old.block_full_count
+        new_acc.partial_block_active_elem_sum[:o] = old.partial_block_active_elem_sum
         new_acc.total_budget_sum[:o] = old.total_budget_sum
         new_acc.effective_cycles_sum[:o] = old.effective_cycles_sum
+        new_acc.zero_element_count[:o] = old.zero_element_count
         new_acc.total_elements[:o] = old.total_elements
         new_acc.total_blocks[:o] = old.total_blocks
         new_acc.num_samples = old.num_samples
         self._layers[layer_name] = new_acc
         return new_acc
 
-    def finalize(self) -> dict:
+    # ──────────────────────────────────────────────────────────────────────
+    #  finalize — reduce accumulated stats into JSON-serializable output
+    # ──────────────────────────────────────────────────────────────────────
+
+    def finalize(self, detail_layer: int = 2) -> dict:
         """
         Reduce all accumulated statistics to a JSON-serializable dict.
+
+        Produces **compact layer summaries** (scalars / small structures) for
+        every layer, and **per-channel detail arrays** only for layers whose
+        name contains ``model.layers.<detail_layer>.``.
+
+        Args:
+            detail_layer: transformer layer index whose sub-modules receive
+                full per-channel detail (default: 2).
 
         Returns:
             {
                 "global": { ... model-wide summary ... },
                 "per_layer": {
-                    "layer_name": {
-                        "bit_level": { ... },
-                        "block_level": { ... },
-                        "channel_level": { ... },
-                    },
-                    ...
+                    "<layer_name>": {
+                        "summary": { bit_level, block_level, channel_level,
+                                     mac_level },
+                        "channel_detail": { ... }   # only for detail_layer
+                    }
                 }
             }
         """
+        detail_prefix = f"model.layers.{detail_layer}."
         per_layer = {}
 
         # Global accumulators
         g_total_elements = 0
         g_zero_elements = 0
+        g_active_elements = 0
         g_p_eff_sum = 0.0
+        g_active_p_eff_sum = 0.0
         g_total_budget = 0.0
         g_effective_cycles = 0.0
         g_total_blocks = 0
         g_zero_blocks = 0
         g_partial_blocks = 0
         g_full_blocks = 0
+        g_partial_active_elem_sum = 0
 
         for layer_name, acc in self._layers.items():
-            total_elem = acc.total_elements.float()  # (out,)
-            total_elem_safe = total_elem.clamp(min=1)  # avoid div-by-zero
-
-            # ── Bit level ──
-            p_mean = (acc.p_eff_sum / total_elem_safe.double()).float()
-            p_var = (acc.p_eff_sq_sum / total_elem_safe.double()
-                     - (acc.p_eff_sum / total_elem_safe.double()) ** 2).clamp(min=0)
-            p_std = p_var.sqrt().float()
-
-            bit_level = {
-                "p_eff_mean": p_mean.cpu().tolist(),
-                "p_eff_std": p_std.cpu().tolist(),
-                "p_eff_histogram": {
-                    "bin_labels": _P_EFF_BIN_LABELS,
-                    "counts": acc.p_eff_hist.cpu().tolist(),  # (out, num_bins)
-                },
-            }
-
-            # ── Block level ──
-            total_blk = acc.total_blocks.float().clamp(min=1)
-            block_level = {
-                "zero_block_count": acc.block_zero_count.cpu().tolist(),
-                "partial_block_count": acc.block_partial_count.cpu().tolist(),
-                "full_block_count": acc.block_full_count.cpu().tolist(),
-                "zero_block_ratio": (acc.block_zero_count.float() / total_blk).cpu().tolist(),
-                "partial_block_ratio": (acc.block_partial_count.float() / total_blk).cpu().tolist(),
-                "full_block_ratio": (acc.block_full_count.float() / total_blk).cpu().tolist(),
-            }
-
-            # ── Channel level ──
-            budget_safe = acc.total_budget_sum.clamp(min=1e-30)
-            # utilization = effective_cycles / (total_budget * nb * bs)
-            # But total_budget_sum is already per-sample budget sum.
-            # effective_cycles_sum is sum of p_eff across all elements.
-            # For utilization: ratio of actual work to maximum possible work.
-            # Max possible = total_budget_sum * nb * bs / nb (budget is per-channel,
-            #   each element in nb*bs can use up to budget cycles)
-            # Actually: total possible cycles for channel j across all samples =
-            #   sum_n(b_final[n,j]) * nb * bs  (each of the nb*bs elements could
-            #   use up to b_final cycles).
-            # But effective_cycles = sum of p_eff which is already the actual
-            #   cycle count per element.
-            # So: total_possible = total_budget_sum * nb * bs (when b_final was
-            #   the budget PER dot-product, and we have nb*bs partial products).
-            # Wait — p_eff is per-element, and there are nb*bs elements per (n,j).
-            # total_budget_sum[j] = sum_n b_final[n,j]
-            # total_possible[j] = total_budget_sum[j] * nb * bs
-            # utilization[j] = effective_cycles_sum[j] / total_possible[j]
-            #
-            # But we don't have nb/bs at finalize time. Compute total_possible
-            # from total_elements and total_budget:
-            # total_possible = total_budget_sum * (total_elements / num_samples_seen)
-            # where total_elements / num_samples_seen = nb * bs per sample.
-            #
-            # Actually total_elements[j] = N_total * nb * bs (same for all j per layer)
-            # So nb*bs = total_elements[j] / N_total ... but N_total was accumulated
-            # redundantly per chunk. Let's use the ratio directly:
-            # utilization = effective_cycles / (total_budget * nb_bs_per_sample)
-            # where nb_bs_per_sample = total_elements / total_budget_sum * b_mean
-            # This is getting circular. Let's just store both raw numbers and let
-            # the user compute ratios.
-
-            channel_level = {
-                "total_budget_cycles": acc.total_budget_sum.float().cpu().tolist(),
-                "effective_cycles": acc.effective_cycles_sum.float().cpu().tolist(),
-                "skipped_cycles": (
-                    acc.total_budget_sum - acc.effective_cycles_sum
-                ).clamp(min=0).float().cpu().tolist(),
-                "utilization": (
-                    acc.effective_cycles_sum / budget_safe
-                ).float().cpu().tolist(),
-            }
-
-            per_layer[layer_name] = {
-                "bit_level": bit_level,
-                "block_level": block_level,
-                "channel_level": channel_level,
-            }
+            want_detail = detail_prefix in layer_name
+            layer_entry = self._finalize_layer(acc, want_detail)
+            per_layer[layer_name] = layer_entry
 
             # ── Accumulate global stats ──
             g_total_elements += acc.total_elements.sum().item()
-            g_zero_elements += acc.p_eff_hist[:, 0].sum().item()  # bin 0 = p_eff in [0, 0.5)
+            g_zero_elements += acc.zero_element_count.sum().item()
+            g_active_elements += acc.active_element_count.sum().item()
             g_p_eff_sum += acc.p_eff_sum.sum().item()
+            g_active_p_eff_sum += acc.active_p_eff_sum.sum().item()
             g_total_budget += acc.total_budget_sum.sum().item()
             g_effective_cycles += acc.effective_cycles_sum.sum().item()
             g_total_blocks += acc.total_blocks.sum().item()
             g_zero_blocks += acc.block_zero_count.sum().item()
             g_partial_blocks += acc.block_partial_count.sum().item()
             g_full_blocks += acc.block_full_count.sum().item()
+            g_partial_active_elem_sum += acc.partial_block_active_elem_sum.sum().item()
 
         g_total_safe = max(g_total_elements, 1)
+        g_active_safe = max(g_active_elements, 1)
         g_blocks_safe = max(g_total_blocks, 1)
+        g_active_macs = g_total_elements - g_zero_elements
+        g_partial_safe = max(g_partial_blocks, 1)
 
         global_stats = {
             "num_layers": len(self._layers),
-            "total_elements": g_total_elements,
-            "zero_elements": g_zero_elements,
-            "zero_element_ratio": round(g_zero_elements / g_total_safe, 6),
+            # MAC level (model-wide)
+            "total_macs": g_total_elements,
+            "active_macs": g_active_macs,
+            "mac_sparsity": round(g_zero_elements / g_total_safe, 6),
+            # Bit level (model-wide)
             "mean_effective_precision": round(g_p_eff_sum / g_total_safe, 4),
+            "active_p_eff_mean": round(g_active_p_eff_sum / g_active_safe, 4),
+            # Channel level (model-wide)
             "total_budget_cycles": round(g_total_budget, 1),
             "effective_cycles": round(g_effective_cycles, 1),
             "global_utilization": round(g_effective_cycles / max(g_total_budget, 1e-30), 6),
+            # Block level (model-wide)
             "total_blocks": g_total_blocks,
             "zero_blocks": g_zero_blocks,
             "zero_block_ratio": round(g_zero_blocks / g_blocks_safe, 6),
@@ -376,6 +359,125 @@ class MSDPerfAccumulator:
             "global": global_stats,
             "per_layer": per_layer,
         }
+
+    def _finalize_layer(self, acc: _LayerAccumulator, want_detail: bool) -> dict:
+        """
+        Produce summary (always) and channel_detail (only if want_detail)
+        for a single layer's accumulator.
+        """
+        total_elem = acc.total_elements.float()  # (out,)
+        total_elem_safe = total_elem.clamp(min=1)
+
+        # ── Per-channel intermediate tensors (on GPU) ──
+        p_mean_ch = (acc.p_eff_sum / total_elem_safe.double()).float()  # (out,)
+        p_var_ch = (acc.p_eff_sq_sum / total_elem_safe.double()
+                    - (acc.p_eff_sum / total_elem_safe.double()) ** 2).clamp(min=0)
+        p_std_ch = p_var_ch.sqrt().float()  # (out,)
+
+        active_safe = acc.active_element_count.clamp(min=1).double()
+        active_p_mean_ch = (acc.active_p_eff_sum / active_safe).float()  # (out,)
+
+        total_blk = acc.total_blocks.float().clamp(min=1)
+        total_blk_sum = acc.total_blocks.sum().float().clamp(min=1)
+        partial_safe = acc.block_partial_count.clamp(min=1).float()
+
+        budget_safe = acc.total_budget_sum.clamp(min=1e-30)
+        utilization_ch = (acc.effective_cycles_sum / budget_safe).float()  # (out,)
+
+        mac_sparsity_ch = (acc.zero_element_count.float() / total_elem_safe)  # (out,)
+
+        # Aggregate histogram across channels: (num_bins,)
+        hist_agg = acc.p_eff_hist.sum(dim=0)  # (num_bins,)
+
+        # Partial block mean active fraction (per-channel, then average)
+        partial_active_frac_ch = (
+            acc.partial_block_active_elem_sum.float() / partial_safe
+        )
+        # Normalize by bs: total_elements[0] / total_blocks[0] = bs
+        bs_est = (total_elem[0] / acc.total_blocks[0].float()).item() if acc.total_blocks[0] > 0 else 1.0
+        partial_active_frac_ch = partial_active_frac_ch / bs_est  # fraction in [0, 1]
+
+        # ── Build compact SUMMARY (always) ──────────────────────────
+        summary = {
+            "bit_level": {
+                "p_eff_mean": round(float(p_mean_ch.mean()), 4),
+                "p_eff_std": round(float(p_std_ch.mean()), 4),
+                "active_p_eff_mean": round(float(active_p_mean_ch.mean()), 4),
+                "p_eff_histogram": {
+                    "bin_labels": _P_EFF_BIN_LABELS,
+                    "counts": hist_agg.cpu().tolist(),
+                },
+            },
+            "block_level": {
+                "total_blocks": int(acc.total_blocks.sum().item()),
+                "zero_block_ratio": round(float(
+                    acc.block_zero_count.sum().float() / total_blk_sum
+                ), 6),
+                "partial_block_ratio": round(float(
+                    acc.block_partial_count.sum().float() / total_blk_sum
+                ), 6),
+                "full_block_ratio": round(float(
+                    acc.block_full_count.sum().float() / total_blk_sum
+                ), 6),
+                "partial_block_mean_active_frac": round(float(partial_active_frac_ch.mean()), 6),
+            },
+            "channel_level": {
+                "budget_mean": round(float(
+                    acc.total_budget_sum.sum() / total_blk_sum
+                ), 2),
+                "effective_cycles_total": round(float(acc.effective_cycles_sum.sum()), 1),
+                "utilization_mean": round(float(utilization_ch.mean()), 6),
+            },
+            "mac_level": {
+                "total_macs": int(acc.total_elements.sum().item()),
+                "active_macs": int(acc.active_element_count.sum().item()),
+                "mac_sparsity": round(float(
+                    acc.zero_element_count.sum().float()
+                    / acc.total_elements.sum().float().clamp(min=1)
+                ), 6),
+            },
+        }
+
+        layer_entry = {"summary": summary}
+
+        # ── Build per-channel DETAIL (only for detail_layer layers) ──
+        if want_detail:
+            channel_detail = {
+                "bit_level": {
+                    "p_eff_mean": p_mean_ch.cpu().tolist(),
+                    "p_eff_std": p_std_ch.cpu().tolist(),
+                    "active_p_eff_mean": active_p_mean_ch.cpu().tolist(),
+                    "p_eff_histogram": {
+                        "bin_labels": _P_EFF_BIN_LABELS,
+                        "counts": acc.p_eff_hist.cpu().tolist(),  # (out, num_bins)
+                    },
+                },
+                "block_level": {
+                    "zero_block_count": acc.block_zero_count.cpu().tolist(),
+                    "partial_block_count": acc.block_partial_count.cpu().tolist(),
+                    "full_block_count": acc.block_full_count.cpu().tolist(),
+                    "zero_block_ratio": (acc.block_zero_count.float() / total_blk).cpu().tolist(),
+                    "partial_block_ratio": (acc.block_partial_count.float() / total_blk).cpu().tolist(),
+                    "full_block_ratio": (acc.block_full_count.float() / total_blk).cpu().tolist(),
+                    "partial_block_active_frac": partial_active_frac_ch.cpu().tolist(),
+                },
+                "channel_level": {
+                    "total_budget_cycles": acc.total_budget_sum.float().cpu().tolist(),
+                    "effective_cycles": acc.effective_cycles_sum.float().cpu().tolist(),
+                    "skipped_cycles": (
+                        acc.total_budget_sum - acc.effective_cycles_sum
+                    ).clamp(min=0).float().cpu().tolist(),
+                    "utilization": utilization_ch.cpu().tolist(),
+                },
+                "mac_level": {
+                    "total_elements": acc.total_elements.cpu().tolist(),
+                    "zero_elements": acc.zero_element_count.cpu().tolist(),
+                    "mac_sparsity": mac_sparsity_ch.cpu().tolist(),
+                },
+            }
+            layer_entry["channel_detail"] = channel_detail
+
+        return layer_entry
 
     def reset(self):
         """Clear all accumulated statistics."""

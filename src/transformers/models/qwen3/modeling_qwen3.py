@@ -1411,10 +1411,16 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             self._msd_context_config_hash = cfg_hash
         return self._msd_context
 
-    def get_perf_stats(self) -> dict | None:
-        """Return finalized MSD performance statistics, or None if MSD is not active."""
+    def get_perf_stats(self, detail_layer: int = 2) -> dict | None:
+        """Return finalized MSD performance statistics, or None if MSD is not active.
+
+        Args:
+            detail_layer: transformer layer index whose sub-modules receive
+                full per-channel detail arrays (default: 2).  All other
+                layers only get compact scalar summaries.
+        """
         if self._msd_context is not None and self._msd_context.perf_stats.has_data:
-            return self._msd_context.perf_stats.finalize()
+            return self._msd_context.perf_stats.finalize(detail_layer=detail_layer)
         return None
 
     def reset_perf_stats(self):
