@@ -444,10 +444,11 @@ class _MXFPLinearBase(nn.Module):
         b_final = b_base.unsqueeze(0) + delta_b
         return b_final
 
-    # Target bytes for the largest intermediate 4D tensor per chunk.
-    # 2 GiB keeps peak well within a single 32 GB GPU even with several
-    # live temporaries.
-    _MSD_CHUNK_TARGET_BYTES: int = 2 * 1024 ** 3  # 2 GiB
+    # Fallback target bytes for the largest intermediate 4D tensor per chunk.
+    # 512 MiB keeps peak (~3x due to coexisting temporaries) within ~1.5 GiB,
+    # safe for 32 GB GPUs even with model weights + NCCL overhead.
+    # Configurable at runtime via config.msd_chunk_target_mib.
+    _MSD_CHUNK_TARGET_BYTES: int = 512 * 1024 ** 2  # 512 MiB fallback
 
     def _forward_msd_truncated(self, x_q, x_scales, w_q, w_scales, N, compute_context):
         """
@@ -484,8 +485,10 @@ class _MXFPLinearBase(nn.Module):
 
         # ── Determine output chunk size ──
         # Largest 4D tensor per chunk is (N, chunk, nb, bs) in float32 (4 bytes).
+        # Use configurable target from config, falling back to class default.
+        chunk_target_bytes = getattr(cfg, 'msd_chunk_target_mib', 512) * 1024 ** 2
         elem_per_slice = N * nb * bs  # elements for chunk=1
-        chunk_size = max(1, self._MSD_CHUNK_TARGET_BYTES // (4 * elem_per_slice))
+        chunk_size = max(1, chunk_target_bytes // (4 * elem_per_slice))
         chunk_size = min(chunk_size, out)  # never exceed actual output dim
 
         # ── Allocate output ──
@@ -522,12 +525,18 @@ class _MXFPLinearBase(nn.Module):
             # which is the effective precision of the products after the given total delay.
             p_eff = b_final_c.unsqueeze(-1).unsqueeze(-1) - total_delay
             p_eff = torch.clamp(p_eff, min=0.0)
+
+            # 4a. Compute max latency metrics (cheap 1D reductions on existing tensors)
+            max_delay_chunk = total_delay.amax(dim=(0, 2, 3))  # (c,) max over N, nb, bs
+            max_budget_chunk = b_final_c.amax(dim=0)            # (c,) max over N
             del total_delay  # free 4D tensor early
 
             # 4b. Record performance statistics (lightweight — no new large tensors)
             if compute_context is not None and compute_context.perf_stats is not None:
                 compute_context.perf_stats.record_chunk(
                     self.layer_name, p_eff, b_final_c, j0, j1, N, nb, bs,
+                    max_delay_chunk=max_delay_chunk,
+                    max_budget_chunk=max_budget_chunk,
                 )
 
             # 5. Truncate products (BSD/NAF truncation)

@@ -102,6 +102,12 @@ class _LayerAccumulator:
         self.total_budget_sum = torch.zeros(out_features, dtype=torch.float64, device=device)
         self.effective_cycles_sum = torch.zeros(out_features, dtype=torch.float64, device=device)
 
+        # ── Channel level: max latency indicators ──
+        # max_budget = running max of b_final[n,j] per channel across all samples
+        # max_total_delay = running max of total_delay per channel across all (n,b,k)
+        self.max_budget = torch.zeros(out_features, dtype=torch.float32, device=device)
+        self.max_total_delay = torch.zeros(out_features, dtype=torch.float32, device=device)
+
         # ── MAC level: element-wise sparsity ──
         # zero_element_count = number of elements with p_eff == 0 (fully skipped MACs)
         self.zero_element_count = torch.zeros(out_features, dtype=torch.int64, device=device)
@@ -155,6 +161,9 @@ class MSDPerfAccumulator:
         N: int,
         nb: int,
         bs: int,
+        *,
+        max_delay_chunk: torch.Tensor | None = None,
+        max_budget_chunk: torch.Tensor | None = None,
     ):
         """
         Record statistics for one output chunk from _forward_msd_truncated.
@@ -170,6 +179,8 @@ class MSDPerfAccumulator:
             N: batch dimension
             nb: number of blocks
             bs: block size
+            max_delay_chunk: (c,) max total_delay per channel for this chunk (optional)
+            max_budget_chunk: (c,) max b_final per channel for this chunk (optional)
         """
         c = j1 - j0
         device = p_eff.device
@@ -230,6 +241,12 @@ class MSDPerfAccumulator:
         acc.total_budget_sum[j0:j1] += b_final_c.double().sum(dim=0)
         acc.effective_cycles_sum[j0:j1] += p_flat_d.sum(dim=(0, 2))
 
+        # ── Channel level: running max latency indicators ──
+        if max_budget_chunk is not None:
+            torch.maximum(acc.max_budget[j0:j1], max_budget_chunk, out=acc.max_budget[j0:j1])
+        if max_delay_chunk is not None:
+            torch.maximum(acc.max_total_delay[j0:j1], max_delay_chunk, out=acc.max_total_delay[j0:j1])
+
         # ── Counting ──
         n_elements = N * nb * bs
         acc.total_elements[j0:j1] += n_elements
@@ -255,6 +272,8 @@ class MSDPerfAccumulator:
         new_acc.partial_block_active_elem_sum[:o] = old.partial_block_active_elem_sum
         new_acc.total_budget_sum[:o] = old.total_budget_sum
         new_acc.effective_cycles_sum[:o] = old.effective_cycles_sum
+        new_acc.max_budget[:o] = old.max_budget
+        new_acc.max_total_delay[:o] = old.max_total_delay
         new_acc.zero_element_count[:o] = old.zero_element_count
         new_acc.total_elements[:o] = old.total_elements
         new_acc.total_blocks[:o] = old.total_blocks
@@ -306,6 +325,8 @@ class MSDPerfAccumulator:
         g_partial_blocks = 0
         g_full_blocks = 0
         g_partial_active_elem_sum = 0
+        g_max_budget = 0.0
+        g_max_total_delay = 0.0
 
         for layer_name, acc in self._layers.items():
             want_detail = detail_prefix in layer_name
@@ -325,6 +346,8 @@ class MSDPerfAccumulator:
             g_partial_blocks += acc.block_partial_count.sum().item()
             g_full_blocks += acc.block_full_count.sum().item()
             g_partial_active_elem_sum += acc.partial_block_active_elem_sum.sum().item()
+            g_max_budget = max(g_max_budget, acc.max_budget.max().item())
+            g_max_total_delay = max(g_max_total_delay, acc.max_total_delay.max().item())
 
         g_total_safe = max(g_total_elements, 1)
         g_active_safe = max(g_active_elements, 1)
@@ -353,6 +376,9 @@ class MSDPerfAccumulator:
             "partial_block_ratio": round(g_partial_blocks / g_blocks_safe, 6),
             "full_blocks": g_full_blocks,
             "full_block_ratio": round(g_full_blocks / g_blocks_safe, 6),
+            # Latency indicators (model-wide worst case)
+            "max_budget": round(g_max_budget, 2),
+            "max_total_delay": round(g_max_total_delay, 2),
         }
 
         return {
@@ -427,6 +453,8 @@ class MSDPerfAccumulator:
                 ), 2),
                 "effective_cycles_total": round(float(acc.effective_cycles_sum.sum()), 1),
                 "utilization_mean": round(float(utilization_ch.mean()), 6),
+                "max_budget": round(float(acc.max_budget.max()), 2),
+                "max_total_delay": round(float(acc.max_total_delay.max()), 2),
             },
             "mac_level": {
                 "total_macs": int(acc.total_elements.sum().item()),
@@ -468,6 +496,8 @@ class MSDPerfAccumulator:
                         acc.total_budget_sum - acc.effective_cycles_sum
                     ).clamp(min=0).float().cpu().tolist(),
                     "utilization": utilization_ch.cpu().tolist(),
+                    "max_budget": acc.max_budget.cpu().tolist(),
+                    "max_total_delay": acc.max_total_delay.cpu().tolist(),
                 },
                 "mac_level": {
                     "total_elements": acc.total_elements.cpu().tolist(),

@@ -110,6 +110,11 @@ class Qwen3Config(PreTrainedConfig):
         msd_calibration_data (`dict`, *optional*):
             Per-layer, per-channel offline B_base values populated by calibration utility.
             Format: {"layer_name": [list of per-channel budgets]}.
+        msd_chunk_target_mib (`int`, *optional*, defaults to 512):
+            Target size in MiB for the largest intermediate 4D tensor per output chunk
+            during MSD truncated dot-product. Controls peak GPU memory: actual peak is
+            roughly 3x this value (multiple coexisting temporaries). Reduce if running
+            into OOM on smaller GPUs; increase for throughput on larger GPUs.
 
     ```python
     >>> from transformers import Qwen3Model, Qwen3Config
@@ -187,6 +192,7 @@ class Qwen3Config(PreTrainedConfig):
         msd_deep_pipeline: bool | None = False,
         msd_pipeline_precision_loss: int | None = 2,
         msd_calibration_data: dict | None = None,
+        msd_chunk_target_mib: int | None = 512,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -243,6 +249,7 @@ class Qwen3Config(PreTrainedConfig):
         self.msd_deep_pipeline = msd_deep_pipeline
         self.msd_pipeline_precision_loss = msd_pipeline_precision_loss
         self.msd_calibration_data = msd_calibration_data
+        self.msd_chunk_target_mib = msd_chunk_target_mib
 
         super().__init__(**kwargs)
 
