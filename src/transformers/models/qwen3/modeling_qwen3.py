@@ -101,6 +101,14 @@ class MSDComputeContext:
         Factory: create an MSDComputeContext from config and model.
         Loads per-channel calibration data if available, else uses uniform default.
         Also registers layer_name on each _MXFPLinearBase module.
+
+        Note: ``model`` is typically the inner ``Qwen3Model`` (passed as
+        ``self.model`` from ``Qwen3ForCausalLM``), so ``named_modules()``
+        yields names like ``layers.0.mlp.gate_proj`` — **without** a
+        leading ``model.`` prefix.  Calibration JSON files produced by
+        ``calibrate.py``, however, use the full path including the prefix
+        (e.g. ``model.layers.0.mlp.gate_proj``).  We therefore try both
+        ``name`` and ``"model." + name`` when looking up calibration data.
         """
         channel_budgets = {}
         calibration_data = config.msd_calibration_data
@@ -108,8 +116,16 @@ class MSDComputeContext:
             if isinstance(module, _MXFPLinearBase):
                 module.layer_name = name
                 module._msd_config = config
-                if calibration_data and name in calibration_data:
-                    budgets_list = calibration_data[name]
+                # Try the module name as-is first, then with "model." prefix
+                # to handle calibration files that use full model paths.
+                cal_key = None
+                if calibration_data:
+                    if name in calibration_data:
+                        cal_key = name
+                    elif "model." + name in calibration_data:
+                        cal_key = "model." + name
+                if cal_key is not None:
+                    budgets_list = calibration_data[cal_key]
                     channel_budgets[name] = torch.tensor(budgets_list, dtype=torch.float32)
                 else:
                     channel_budgets[name] = torch.full(
@@ -228,6 +244,52 @@ def _naf_digit_width(naf_pos, naf_neg):
         torch.zeros_like(combined),
     )
     return width
+
+
+def _compute_naf_widths(value):
+    """
+    Compute the NAF (Non-Adjacent Form) digit width of each element.
+
+    The width is the number of digit positions in the NAF representation,
+    i.e. the minimum number of MSD-first cycles needed to fully produce
+    each element.  For zero elements the width is 0.
+
+    Memory note: creates several same-shape intermediates; ``del``s them
+    eagerly.  Runs under ``torch.no_grad()``.
+
+    Args:
+        value: float32 tensor (any shape)
+    Returns:
+        naf_width: int32 tensor, same shape as value
+    """
+    with torch.no_grad():
+        abs_v = value.abs()
+        # Scale to integer mantissa with MSB near bit-23
+        msb_pos = torch.floor(torch.log2(abs_v.clamp(min=1e-45)))
+        scale_up = torch.pow(2.0, 23.0 - msb_pos)
+        del msb_pos
+        x_scaled = torch.round(abs_v * scale_up).to(torch.int32)
+        del abs_v, scale_up
+
+        # NAF conversion
+        x_h = x_scaled >> 1
+        s = x_scaled + x_h
+        del x_scaled
+        naf_pos = s & (~x_h)
+        naf_neg = x_h & (~s)
+        del x_h, s
+
+        # Width = 1 + floor(log2(combined)) for non-zero, else 0
+        combined = naf_pos | naf_neg
+        del naf_pos, naf_neg
+        comb_f = combined.float()
+        width = torch.where(
+            combined > 0,
+            torch.floor(torch.log2(comb_f)).int() + 1,
+            torch.zeros_like(combined),
+        )
+        del combined, comb_f
+        return width
 
 
 def _msd_truncate(value, num_digits):
@@ -531,13 +593,18 @@ class _MXFPLinearBase(nn.Module):
             max_budget_chunk = b_final_c.amax(dim=0)            # (c,) max over N
             del total_delay  # free 4D tensor early
 
-            # 4b. Record performance statistics (lightweight — no new large tensors)
+            # 4b. Compute NAF widths of products for block-completion stats
+            naf_width = _compute_naf_widths(prods)  # (N, c, nb, bs) int32
+
+            # 4c. Record performance statistics (lightweight — no new large tensors)
             if compute_context is not None and compute_context.perf_stats is not None:
                 compute_context.perf_stats.record_chunk(
                     self.layer_name, p_eff, b_final_c, j0, j1, N, nb, bs,
                     max_delay_chunk=max_delay_chunk,
                     max_budget_chunk=max_budget_chunk,
+                    naf_width=naf_width,
                 )
+            del naf_width
 
             # 5. Truncate products (BSD/NAF truncation)
             prods_trunc = _msd_truncate(prods, p_eff)

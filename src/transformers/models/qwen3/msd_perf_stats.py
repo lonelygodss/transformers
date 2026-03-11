@@ -86,8 +86,10 @@ class _LayerAccumulator:
         self.active_element_count = torch.zeros(out_features, dtype=torch.int64, device=device)
 
         # ── Block level: activation categories ──
-        # At block granularity: a block (n,j,b) is "zero" if ALL bs elements
-        # in it have p_eff == 0; "full" if ALL have p_eff > 0; else "partial".
+        # At block granularity:
+        #   "zero"    — ALL bs elements have p_eff == 0  (no work done)
+        #   "full"    — ALL bs elements completed: p_eff >= naf_width (every MAC finished)
+        #   "partial" — neither zero nor full (some elements truncated by budget)
         self.block_zero_count = torch.zeros(out_features, dtype=torch.int64, device=device)
         self.block_partial_count = torch.zeros(out_features, dtype=torch.int64, device=device)
         self.block_full_count = torch.zeros(out_features, dtype=torch.int64, device=device)
@@ -108,9 +110,11 @@ class _LayerAccumulator:
         self.max_budget = torch.zeros(out_features, dtype=torch.float32, device=device)
         self.max_total_delay = torch.zeros(out_features, dtype=torch.float32, device=device)
 
-        # ── MAC level: element-wise sparsity ──
+        # ── MAC level: element-wise sparsity & completion ──
         # zero_element_count = number of elements with p_eff == 0 (fully skipped MACs)
+        # completed_element_count = number of elements with p_eff >= naf_width (fully finished MACs)
         self.zero_element_count = torch.zeros(out_features, dtype=torch.int64, device=device)
+        self.completed_element_count = torch.zeros(out_features, dtype=torch.int64, device=device)
 
         # ── Counting ──
         self.total_elements = torch.zeros(out_features, dtype=torch.int64, device=device)
@@ -164,6 +168,7 @@ class MSDPerfAccumulator:
         *,
         max_delay_chunk: torch.Tensor | None = None,
         max_budget_chunk: torch.Tensor | None = None,
+        naf_width: torch.Tensor | None = None,
     ):
         """
         Record statistics for one output chunk from _forward_msd_truncated.
@@ -172,7 +177,7 @@ class MSDPerfAccumulator:
         (no new large allocations).
 
         Args:
-            layer_name: e.g. "model.layers.0.mlp.gate_proj"
+            layer_name: e.g. "layers.0.mlp.gate_proj"
             p_eff: (N, c, nb, bs) effective precision tensor (float32)
             b_final_c: (N, c) per-sample per-channel budget for this chunk
             j0, j1: output channel slice [j0, j1)
@@ -181,6 +186,9 @@ class MSDPerfAccumulator:
             bs: block size
             max_delay_chunk: (c,) max total_delay per channel for this chunk (optional)
             max_budget_chunk: (c,) max b_final per channel for this chunk (optional)
+            naf_width: (N, c, nb, bs) NAF digit width of each product element (int32, optional).
+                       When provided, enables correct full/partial block classification
+                       (full = every element completed, not just active).
         """
         c = j1 - j0
         device = p_eff.device
@@ -217,7 +225,7 @@ class MSDPerfAccumulator:
         acc.active_p_eff_sum[j0:j1] += (p_flat_d * active_mask).sum(dim=(0, 2))
         del active_mask
 
-        # ── MAC level (element sparsity) ──
+        # ── MAC level (element sparsity & completion) ──
         zero_count = (p_flat == 0).sum(dim=(0, 2))  # (c,)
         acc.zero_element_count[j0:j1] += zero_count.long()
 
@@ -225,7 +233,27 @@ class MSDPerfAccumulator:
         p_block = p_eff.reshape(N, c, nb, bs)
         block_active_count = (p_block > 0).sum(dim=-1)  # (N, c, nb)
         block_is_zero = (block_active_count == 0)
-        block_is_full = (block_active_count == bs)
+
+        if naf_width is not None:
+            # Correct definitions using NAF digit widths:
+            #   "full"  = every element in the block completed (p_eff >= naf_width)
+            #   "partial" = not zero AND not full (some elements truncated by budget)
+            naf_block = naf_width.reshape(N, c, nb, bs)  # (N, c, nb, bs)
+            # An element is "completed" when it has no unprocessed digits
+            elem_completed = (p_eff.reshape(N, c, nb, bs) >= naf_block.float())
+            block_completed_count = elem_completed.sum(dim=-1)  # (N, c, nb)
+            block_is_full = (block_completed_count == bs)
+            del naf_block, elem_completed, block_completed_count
+
+            # Also count completed elements model-wide for MAC stats
+            completed_flat = (p_flat >= naf_width.reshape(N, c, nb * bs).float())
+            completed_count = completed_flat.sum(dim=(0, 2))  # (c,)
+            acc.completed_element_count[j0:j1] += completed_count.long()
+            del completed_flat, completed_count
+        else:
+            # Fallback: without naf_width, use the old heuristic (all elements active)
+            block_is_full = (block_active_count == bs)
+
         block_is_partial = ~block_is_zero & ~block_is_full
 
         acc.block_zero_count[j0:j1] += block_is_zero.sum(dim=(0, 2)).long()
@@ -275,6 +303,7 @@ class MSDPerfAccumulator:
         new_acc.max_budget[:o] = old.max_budget
         new_acc.max_total_delay[:o] = old.max_total_delay
         new_acc.zero_element_count[:o] = old.zero_element_count
+        new_acc.completed_element_count[:o] = old.completed_element_count
         new_acc.total_elements[:o] = old.total_elements
         new_acc.total_blocks[:o] = old.total_blocks
         new_acc.num_samples = old.num_samples
@@ -309,7 +338,7 @@ class MSDPerfAccumulator:
                 }
             }
         """
-        detail_prefix = f"model.layers.{detail_layer}."
+        detail_prefix = f"layers.{detail_layer}."
         per_layer = {}
 
         # Global accumulators
@@ -324,6 +353,7 @@ class MSDPerfAccumulator:
         g_zero_blocks = 0
         g_partial_blocks = 0
         g_full_blocks = 0
+        g_completed_elements = 0
         g_partial_active_elem_sum = 0
         g_max_budget = 0.0
         g_max_total_delay = 0.0
@@ -345,6 +375,7 @@ class MSDPerfAccumulator:
             g_zero_blocks += acc.block_zero_count.sum().item()
             g_partial_blocks += acc.block_partial_count.sum().item()
             g_full_blocks += acc.block_full_count.sum().item()
+            g_completed_elements += acc.completed_element_count.sum().item()
             g_partial_active_elem_sum += acc.partial_block_active_elem_sum.sum().item()
             g_max_budget = max(g_max_budget, acc.max_budget.max().item())
             g_max_total_delay = max(g_max_total_delay, acc.max_total_delay.max().item())
@@ -360,7 +391,9 @@ class MSDPerfAccumulator:
             # MAC level (model-wide)
             "total_macs": g_total_elements,
             "active_macs": g_active_macs,
+            "completed_macs": g_completed_elements,
             "mac_sparsity": round(g_zero_elements / g_total_safe, 6),
+            "mac_completion_ratio": round(g_completed_elements / g_total_safe, 6),
             # Bit level (model-wide)
             "mean_effective_precision": round(g_p_eff_sum / g_total_safe, 4),
             "active_p_eff_mean": round(g_active_p_eff_sum / g_active_safe, 4),
@@ -459,8 +492,13 @@ class MSDPerfAccumulator:
             "mac_level": {
                 "total_macs": int(acc.total_elements.sum().item()),
                 "active_macs": int(acc.active_element_count.sum().item()),
+                "completed_macs": int(acc.completed_element_count.sum().item()),
                 "mac_sparsity": round(float(
                     acc.zero_element_count.sum().float()
+                    / acc.total_elements.sum().float().clamp(min=1)
+                ), 6),
+                "mac_completion_ratio": round(float(
+                    acc.completed_element_count.sum().float()
                     / acc.total_elements.sum().float().clamp(min=1)
                 ), 6),
             },
@@ -502,7 +540,9 @@ class MSDPerfAccumulator:
                 "mac_level": {
                     "total_elements": acc.total_elements.cpu().tolist(),
                     "zero_elements": acc.zero_element_count.cpu().tolist(),
+                    "completed_elements": acc.completed_element_count.cpu().tolist(),
                     "mac_sparsity": mac_sparsity_ch.cpu().tolist(),
+                    "mac_completion_ratio": (acc.completed_element_count.float() / total_elem_safe).cpu().tolist(),
                 },
             }
             layer_entry["channel_detail"] = channel_detail
