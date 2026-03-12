@@ -416,30 +416,44 @@ def _msd_truncate(value, num_digits):
 
 # ── BSD metadata & PWL SiLU for BSD-penetration FFN ─────────────────────────
 
-# SiLU cycle cost breakdown (PWL approximation in MSD-first online arithmetic):
-#   Segment detection (~3 cycles): sign bit + 2-3 MSDs identify which of N segments
-#   PWL linear evaluation (~1 cycle): pipelined a_i * x + b_i with parallel coefficients
-#   SiLU multiply x * sigmoid_pwl(x) (~2 cycles): online multiplier delay δ=2
-_SILU_PWL_LATENCY_CYCLES = 6
+# SiLU cycle cost (PWL approximation, MSD-first with exponent-based segment detection):
+#   Segment detection (0 cycles from BSD stream): uses BSDMetadata.exponent directly,
+#     which is available as parallel metadata before the BSD mantissa stream begins.
+#   PWL sigmoid eval (3 cycles): online multiply δ=2 (slope × x) + online add δ=1 (+intercept)
+#   SiLU multiply x × σ_PWL(x) (2 cycles): online multiplier delay δ=2
+_SILU_PWL_LATENCY_CYCLES = 5
 
 
 class BSDMetadata:
     """
     Per-element metadata for values in BSD (NAF) representation.
 
-    Tracks the MSD exponent (position of the most significant digit) and the
-    number of valid NAF digits remaining after truncation.  This metadata
-    propagates through element-wise operations (SiLU, gating multiply) to
-    inform downstream GEMM stages of input precision.
+    Carries the exponent (MSD position) and mantissa precision separately
+    through the FFN pipeline.  This separation is a key design principle:
+    exponents propagate as parallel metadata available immediately, while
+    BSD mantissa digits flow serially in the MSD-first stream.  Avoiding
+    shift-and-align hardware, necessary alignment is offloaded to the
+    time domain via inter-block delays in MSD-first online arithmetic.
 
-    When entering a GEMM (down_proj), elements are grouped into blocks and
-    the metadata maps to the existing delay model:
+    For GEMM outputs:
+      - exponent = E_max (maximum combined block-scale exponent), known
+        from MXFP block scales before any BSD mantissa digit arrives.
+      - precision = B_final - δ  (cycle budget minus online startup delay).
+        Inter-block delays are NOT subtracted here because they already
+        govern per-element product truncation inside the GEMM.
+
+    For element-wise ops (SiLU, gating multiply):
+      - exponent is recomputed from the truncated result value.
+      - precision is input precision minus the operation's cycle cost.
+
+    When entering a downstream GEMM (down_proj), elements are grouped into
+    blocks and the metadata maps to the delay model:
       - block-level max exponent → inter-block alignment delay
       - per-element precision → caps product effective precision
 
     Attributes:
-        exponent: (N, dim) float32 — floor(log2(|value|)) per element
-        precision: (N, dim) float32 — valid NAF digits remaining per element
+        exponent: (N, dim) float32 — MSD position per element
+        precision: (N, dim) float32 — valid BSD mantissa digits remaining
     """
 
     __slots__ = ("exponent", "precision")
@@ -449,31 +463,41 @@ class BSDMetadata:
         self.precision = precision
 
 
-def _extract_bsd_metadata(output, b_final, inter_delays, online_delay):
+def _extract_bsd_metadata(output, b_final, e_max, online_delay):
     """
     Extract per-output-element BSD metadata from an MSD truncated dot-product.
 
+    The exponent is E_max — the maximum combined block-scale exponent per
+    (sample, output-channel) pair, known from MXFP block scales before any
+    BSD mantissa digit arrives.  This avoids deriving exponent from the
+    computed output value, keeping exponent and mantissa metadata separate.
+
+    The precision is B_final - δ (cycle budget minus online startup delay).
+    Inter-block delays are NOT subtracted: they already govern per-element
+    product truncation inside the GEMM.  Once the first MSD of the
+    accumulator output arrives, every subsequent cycle produces one more
+    valid digit, up to B_final - δ total.
+
     Args:
-        output:   (N, out) float32 — dot-product result
+        output:   (N, out) float32 — dot-product result (used for zero-masking)
         b_final:  (N, out) float32 — per-channel cycle budget used
-        inter_delays: (N, out, nb) float32 — inter-block alignment delays
+        e_max:    (N, out) float32 — maximum combined block-scale exponent
         online_delay: int — MSD online multiplier delay δ
     Returns:
         BSDMetadata with exponent (N, out) and precision (N, out)
     """
-    # Exponent: position of MSD in the output value
-    abs_out = output.abs()
+    # Exponent: E_max from block scales (hardware-assigned MSD position).
+    # For zero outputs, set exponent to -60 (effectively no signal).
     exponent = torch.where(
-        abs_out > 0,
-        torch.floor(torch.log2(abs_out.clamp(min=1e-45))),
+        output.abs() > 0,
+        e_max,
         torch.tensor(-60.0, dtype=output.dtype, device=output.device),
     )
-    # Output precision: budget minus worst-case inter-block delay minus online delay.
-    # This is a conservative per-channel estimate: the actual precision varies per-block
-    # and per-element product, but the channel-level minimum (driven by the worst-case
-    # block delay) limits the output's overall BSD digit count.
-    max_inter_delay = inter_delays.amax(dim=-1)  # (N, out) — worst case across blocks
-    precision = torch.clamp(b_final - max_inter_delay - online_delay, min=0.0)
+    # Precision: budget minus online startup delay.
+    # Inter-block delays are already accounted for in per-element product
+    # truncation (step 6 of the GEMM), so they do not reduce the output
+    # stream's digit count.
+    precision = torch.clamp(b_final - online_delay, min=0.0)
     return BSDMetadata(exponent, precision)
 
 
@@ -514,8 +538,10 @@ def _pwl_sigmoid(x, n_segments=8, _cache={}):
     Piecewise-linear sigmoid approximation.
 
     Models the hardware PWL evaluation:
-      1. Segment detection (from leading digits of x)
+      1. Segment detection (from BSDMetadata.exponent — available as parallel
+         metadata before the BSD mantissa stream begins, 0 cycles cost)
       2. Linear evaluation: slope[i] * x + intercept[i]
+         (online multiply δ=2 for slope*x, online add δ=1 for +intercept)
 
     Saturates to 0 for x < -6, to 1 for x > 6.
 
@@ -552,8 +578,16 @@ def _msd_silu_pwl(x, input_bsd, n_segments=8, online_delay=2):
     Computes SiLU(x) = x * sigmoid_pwl(x), then truncates the result to
     the effective output precision, accounting for the SiLU hardware latency.
 
-    The output precision per element is:
-        p_out[n,j] = max(0, p_in[n,j] - _SILU_PWL_LATENCY_CYCLES)
+    Segment detection uses input_bsd.exponent (available immediately as
+    parallel metadata from the upstream GEMM block scales) to identify the
+    PWL region.  This costs 0 cycles from the BSD mantissa stream.
+
+    Total SiLU latency = 5 cycles:
+      - PWL sigmoid eval: 3 cycles (online multiply δ=2 + online add δ=1)
+      - SiLU multiply x × σ(x): 2 cycles (online multiplier δ=2)
+
+    Output precision per element:
+        p_out[n,j] = max(0, p_in[n,j] - 5)
 
     Args:
         x:           (N, dim) float32 — input values (gate_proj output)
@@ -817,7 +851,8 @@ class _MXFPLinearBase(nn.Module):
         online_delay = cfg.msd_online_delay
 
         # 1. Inter-block delays from shared scales: (N, out, nb)
-        inter_delays, _ = _compute_inter_block_delays(w_scales, x_scales)
+        # e_max: (N, out) maximum combined block-scale exponent per channel
+        inter_delays, e_max = _compute_inter_block_delays(w_scales, x_scales)
 
         # 2. Intra-block delays from activation element exponents: (N, nb, bs)
         intra_delays = _compute_intra_block_delays(x_q)
@@ -857,7 +892,7 @@ class _MXFPLinearBase(nn.Module):
         result = (block_dots * combined_scales).sum(dim=-1)  # (N, out)
 
         if return_bsd_metadata:
-            bsd_meta = _extract_bsd_metadata(result, b_final, inter_delays, online_delay)
+            bsd_meta = _extract_bsd_metadata(result, b_final, e_max, online_delay)
             return result, bsd_meta
         return result
 
