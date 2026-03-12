@@ -104,9 +104,22 @@ class Qwen3Config(PreTrainedConfig):
         msd_budget_dynamic_mode (`str`, *optional*, defaults to `"linear"`):
             Mode for dynamic budget override: "linear" or "step".
         msd_deep_pipeline (`bool`, *optional*, defaults to `False`):
-            Enable cross-layer MSD streaming through MLP (gate->silu->*up->down).
+            Enable deep pipeline through MLP (gate->silu->gating->down) with unified
+            pipeline budget. Implies msd_bsd_penetration=True.
+        msd_bsd_penetration (`bool`, *optional*, defaults to `False`):
+            Enable BSD representation penetration through the full FFN layer.
+            Each computation step runs independently with its own MSD budget, but
+            data stays in BSD representation (no MXFP re-quantization between steps).
+            SiLU is modeled as a piecewise-linear (PWL) approximation.
+        msd_pipeline_budget (`int`, *optional*, defaults to 24):
+            Total cycle budget for the coupled pipeline stages (gate_proj->SiLU->gating)
+            in deep pipeline mode. Must be > silu_latency + online_delay.
+        msd_silu_pwl_segments (`int`, *optional*, defaults to 8):
+            Number of piecewise-linear segments for the PWL sigmoid approximation
+            used in MSD-first SiLU evaluation. More segments = better approximation.
         msd_pipeline_precision_loss (`int`, *optional*, defaults to 2):
-            Per-stage precision loss (in digits) for each pipeline stage in deep pipelining mode.
+            [DEPRECATED] Legacy per-stage precision loss. Kept for backward compatibility.
+            Use msd_bsd_penetration + msd_pipeline_budget instead.
         msd_calibration_data (`dict`, *optional*):
             Per-layer, per-channel offline B_base values populated by calibration utility.
             Format: {"layer_name": [list of per-channel budgets]}.
@@ -190,6 +203,9 @@ class Qwen3Config(PreTrainedConfig):
         msd_budget_dynamic_threshold: float | None = 0.0,
         msd_budget_dynamic_mode: str | None = "linear",
         msd_deep_pipeline: bool | None = False,
+        msd_bsd_penetration: bool | None = False,
+        msd_pipeline_budget: int | None = 24,
+        msd_silu_pwl_segments: int | None = 8,
         msd_pipeline_precision_loss: int | None = 2,
         msd_calibration_data: dict | None = None,
         msd_chunk_target_mib: int | None = 512,
@@ -247,6 +263,9 @@ class Qwen3Config(PreTrainedConfig):
         self.msd_budget_dynamic_threshold = msd_budget_dynamic_threshold
         self.msd_budget_dynamic_mode = msd_budget_dynamic_mode
         self.msd_deep_pipeline = msd_deep_pipeline
+        self.msd_bsd_penetration = msd_bsd_penetration
+        self.msd_pipeline_budget = msd_pipeline_budget
+        self.msd_silu_pwl_segments = msd_silu_pwl_segments
         self.msd_pipeline_precision_loss = msd_pipeline_precision_loss
         self.msd_calibration_data = msd_calibration_data
         self.msd_chunk_target_mib = msd_chunk_target_mib

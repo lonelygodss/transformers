@@ -164,13 +164,16 @@ class MSDComputeContext:
     def __init__(self, channel_budgets, default_budget, config):
         self.channel_budgets = channel_budgets
         self.default_budget = default_budget
-        self.pipeline_precision_remaining = None
+        self.pipeline_precision_remaining = None  # DEPRECATED: kept for backward compat
         self.activation_scales = {}
         self.budget_dynamic_scale = config.msd_budget_dynamic_scale
         self.budget_dynamic_threshold = config.msd_budget_dynamic_threshold
         self.budget_dynamic_mode = config.msd_budget_dynamic_mode
         self.online_delay = config.msd_online_delay
         self.pipeline_precision_loss = config.msd_pipeline_precision_loss
+        self.pipeline_budget = getattr(config, "msd_pipeline_budget", 24)
+        self.bsd_penetration = getattr(config, "msd_bsd_penetration", False)
+        self.silu_pwl_segments = getattr(config, "msd_silu_pwl_segments", 8)
 
     @staticmethod
     def activate(ctx):
@@ -411,21 +414,233 @@ def _msd_truncate(value, num_digits):
         return torch.where(mask, result, torch.zeros_like(result))
 
 
-# ── Deep pipeline helpers ────────────────────────────────────────────────────
+# ── BSD metadata & PWL SiLU for BSD-penetration FFN ─────────────────────────
+
+# SiLU cycle cost breakdown (PWL approximation in MSD-first online arithmetic):
+#   Segment detection (~3 cycles): sign bit + 2-3 MSDs identify which of N segments
+#   PWL linear evaluation (~1 cycle): pipelined a_i * x + b_i with parallel coefficients
+#   SiLU multiply x * sigmoid_pwl(x) (~2 cycles): online multiplier delay δ=2
+_SILU_PWL_LATENCY_CYCLES = 6
+
+
+class BSDMetadata:
+    """
+    Per-element metadata for values in BSD (NAF) representation.
+
+    Tracks the MSD exponent (position of the most significant digit) and the
+    number of valid NAF digits remaining after truncation.  This metadata
+    propagates through element-wise operations (SiLU, gating multiply) to
+    inform downstream GEMM stages of input precision.
+
+    When entering a GEMM (down_proj), elements are grouped into blocks and
+    the metadata maps to the existing delay model:
+      - block-level max exponent → inter-block alignment delay
+      - per-element precision → caps product effective precision
+
+    Attributes:
+        exponent: (N, dim) float32 — floor(log2(|value|)) per element
+        precision: (N, dim) float32 — valid NAF digits remaining per element
+    """
+
+    __slots__ = ("exponent", "precision")
+
+    def __init__(self, exponent: torch.Tensor, precision: torch.Tensor):
+        self.exponent = exponent
+        self.precision = precision
+
+
+def _extract_bsd_metadata(output, b_final, inter_delays, online_delay):
+    """
+    Extract per-output-element BSD metadata from an MSD truncated dot-product.
+
+    Args:
+        output:   (N, out) float32 — dot-product result
+        b_final:  (N, out) float32 — per-channel cycle budget used
+        inter_delays: (N, out, nb) float32 — inter-block alignment delays
+        online_delay: int — MSD online multiplier delay δ
+    Returns:
+        BSDMetadata with exponent (N, out) and precision (N, out)
+    """
+    # Exponent: position of MSD in the output value
+    abs_out = output.abs()
+    exponent = torch.where(
+        abs_out > 0,
+        torch.floor(torch.log2(abs_out.clamp(min=1e-45))),
+        torch.tensor(-60.0, dtype=output.dtype, device=output.device),
+    )
+    # Output precision: budget minus worst-case inter-block delay minus online delay.
+    # This is a conservative per-channel estimate: the actual precision varies per-block
+    # and per-element product, but the channel-level minimum (driven by the worst-case
+    # block delay) limits the output's overall BSD digit count.
+    max_inter_delay = inter_delays.amax(dim=-1)  # (N, out) — worst case across blocks
+    precision = torch.clamp(b_final - max_inter_delay - online_delay, min=0.0)
+    return BSDMetadata(exponent, precision)
+
+
+def _build_pwl_sigmoid_lut(n_segments, device):
+    """
+    Build a piecewise-linear (PWL) approximation of sigmoid(x) in [-6, 6].
+
+    The approximation uses n_segments linear pieces in [-6, 6] plus two
+    saturation tails (σ(x)≈0 for x<-6, σ(x)≈1 for x>6).
+
+    For each segment i covering [x_i, x_{i+1}]:
+        σ_approx(x) = slopes[i] * x + intercepts[i]
+
+    The slopes and intercepts are computed by fitting to the exact sigmoid
+    at the segment boundaries (linear interpolation).
+
+    Args:
+        n_segments: int — number of linear pieces in the transition region
+        device: torch.device
+    Returns:
+        boundaries: (n_segments + 1,) float32 — segment boundary x-values
+        slopes:     (n_segments,) float32
+        intercepts: (n_segments,) float32
+    """
+    import math as _math
+    # Segment boundaries: uniformly spaced in [-6, 6]
+    boundaries = torch.linspace(-6.0, 6.0, n_segments + 1, dtype=torch.float32, device=device)
+    # Exact sigmoid at boundaries
+    sig_vals = 1.0 / (1.0 + torch.exp(-boundaries))
+    # Slopes and intercepts for each segment
+    slopes = (sig_vals[1:] - sig_vals[:-1]) / (boundaries[1:] - boundaries[:-1])
+    intercepts = sig_vals[:-1] - slopes * boundaries[:-1]
+    return boundaries, slopes, intercepts
+
+
+def _pwl_sigmoid(x, n_segments=8, _cache={}):
+    """
+    Piecewise-linear sigmoid approximation.
+
+    Models the hardware PWL evaluation:
+      1. Segment detection (from leading digits of x)
+      2. Linear evaluation: slope[i] * x + intercept[i]
+
+    Saturates to 0 for x < -6, to 1 for x > 6.
+
+    Args:
+        x: float32 tensor (any shape)
+        n_segments: int — number of PWL segments (default 8)
+    Returns:
+        float32 tensor, same shape as x
+    """
+    cache_key = (n_segments, x.device)
+    if cache_key not in _cache:
+        _cache[cache_key] = _build_pwl_sigmoid_lut(n_segments, x.device)
+    boundaries, slopes, intercepts = _cache[cache_key]
+
+    # Determine segment index for each element via searchsorted
+    # searchsorted returns position where x would be inserted in boundaries
+    # We want the segment index = clamp(searchsorted - 1, 0, n_segments - 1)
+    idx = torch.searchsorted(boundaries.contiguous(), x.contiguous().reshape(-1))
+    idx = (idx - 1).clamp(0, n_segments - 1)  # segment index
+
+    # Evaluate PWL: slope[idx] * x + intercept[idx]
+    x_flat = x.reshape(-1)
+    result = slopes[idx] * x_flat + intercepts[idx]
+
+    # Saturate tails
+    result = result.clamp(0.0, 1.0)
+    return result.view(x.shape)
+
+
+def _msd_silu_pwl(x, input_bsd, n_segments=8, online_delay=2):
+    """
+    MSD-first SiLU using PWL sigmoid approximation with BSD metadata propagation.
+
+    Computes SiLU(x) = x * sigmoid_pwl(x), then truncates the result to
+    the effective output precision, accounting for the SiLU hardware latency.
+
+    The output precision per element is:
+        p_out[n,j] = max(0, p_in[n,j] - _SILU_PWL_LATENCY_CYCLES)
+
+    Args:
+        x:           (N, dim) float32 — input values (gate_proj output)
+        input_bsd:   BSDMetadata — BSD metadata from gate_proj
+        n_segments:  int — PWL segment count
+        online_delay: int — base online delay δ (used in latency model)
+    Returns:
+        result:    (N, dim) float32 — SiLU output
+        out_bsd:   BSDMetadata — updated BSD metadata
+    """
+    silu_latency = _SILU_PWL_LATENCY_CYCLES
+
+    # Compute PWL sigmoid * x
+    sigmoid_approx = _pwl_sigmoid(x, n_segments=n_segments)
+    silu_out = x * sigmoid_approx
+
+    # Output precision: input precision minus SiLU hardware cycles
+    p_out = torch.clamp(input_bsd.precision - silu_latency, min=0.0)
+
+    # Truncate to output precision (models digit-limited hardware output)
+    result = _msd_truncate(silu_out, p_out)
+
+    # Output exponent: recompute from actual result values
+    abs_r = result.abs()
+    out_exp = torch.where(
+        abs_r > 0,
+        torch.floor(torch.log2(abs_r.clamp(min=1e-45))),
+        torch.tensor(-60.0, dtype=result.dtype, device=result.device),
+    )
+
+    return result, BSDMetadata(out_exp, p_out)
+
+
+def _msd_gating_mul(silu_val, silu_bsd, up_val, up_bsd, online_delay=2):
+    """
+    MSD-first element-wise gating multiply: SiLU(gate) * up.
+
+    Both inputs arrive as MSD-first BSD streams. The gating multiply waits
+    for both streams, then performs an online multiplication with delay δ.
+
+    The SiLU path is slower by _SILU_PWL_LATENCY_CYCLES cycles (the up_proj
+    path's digits have been buffered during this time — no precision loss
+    from waiting). The precision loss comes only from the online multiply delay.
+
+    Output precision per element:
+        p_gating[n,j] = max(0, min(silu_bsd.precision, up_bsd.precision) - online_delay)
+
+    Args:
+        silu_val: (N, dim) float32 — SiLU output values
+        silu_bsd: BSDMetadata — SiLU output BSD metadata
+        up_val:   (N, dim) float32 — up_proj output values
+        up_bsd:   BSDMetadata — up_proj BSD metadata
+        online_delay: int — online multiplier delay δ
+    Returns:
+        result:   (N, dim) float32 — gating product
+        out_bsd:  BSDMetadata — output BSD metadata
+    """
+    # Precision limited by the less precise input, minus online multiply delay
+    p_gating = torch.clamp(
+        torch.minimum(silu_bsd.precision, up_bsd.precision) - online_delay,
+        min=0.0,
+    )
+
+    # Compute product and truncate to output precision
+    product = silu_val * up_val
+    result = _msd_truncate(product, p_gating)
+
+    # Output exponent from actual result
+    abs_r = result.abs()
+    out_exp = torch.where(
+        abs_r > 0,
+        torch.floor(torch.log2(abs_r.clamp(min=1e-45))),
+        torch.tensor(-60.0, dtype=result.dtype, device=result.device),
+    )
+
+    return result, BSDMetadata(out_exp, p_gating)
+
+
+# ── Deep pipeline helpers (DEPRECATED — kept for backward compat) ────────────
 
 def _msd_silu(x, precision_digits):
     """
-    Apply SiLU activation in MSD-simulated mode.
+    [DEPRECATED] Apply SiLU activation in MSD-simulated mode.
 
-    Applies float SiLU then truncates to `precision_digits` most significant
-    BSD (NAF) digits to model digit-loss from MSD-first nonlinear evaluation
-    (avoids true digit-serial CORDIC SiLU).
-
-    Args:
-        x: float32 tensor
-        precision_digits: float32 tensor or scalar, per-element precision
-    Returns:
-        truncated SiLU output
+    Superseded by _msd_silu_pwl() which uses PWL sigmoid approximation and
+    tracks BSD metadata. Kept for backward compatibility with legacy deep
+    pipeline mode (msd_deep_pipeline=True without msd_bsd_penetration=True).
     """
     result = F.silu(x)
     return _msd_truncate(result, precision_digits)
@@ -433,16 +648,10 @@ def _msd_silu(x, precision_digits):
 
 def _msd_elementwise_mul(a, b, precision_digits):
     """
-    MSD-simulated element-wise multiply with BSD (NAF) truncation.
+    [DEPRECATED] MSD-simulated element-wise multiply with BSD (NAF) truncation.
 
-    Product of two P-digit MSD values produces 2P digits, but output
-    stream retains only precision_digits BSD digits (modeling online delay loss).
-
-    Args:
-        a, b: float32 tensors (same shape)
-        precision_digits: float32 tensor or scalar, per-element output precision
-    Returns:
-        truncated element-wise product
+    Superseded by _msd_gating_mul() which tracks BSD metadata.
+    Kept for backward compatibility.
     """
     result = a * b
     return _msd_truncate(result, precision_digits)
@@ -579,7 +788,8 @@ class _MXFPLinearBase(nn.Module):
         return b_final
 
     def _forward_msd_truncated(
-        self, x_q, x_scales, w_q, w_scales, N, compute_context
+        self, x_q, x_scales, w_q, w_scales, N, compute_context,
+        return_bsd_metadata=False,
     ):
         """
         MSD-first truncated dot-product simulation.
@@ -595,8 +805,10 @@ class _MXFPLinearBase(nn.Module):
             w_scales: (out, nb) weight block shared scales
             N:        batch dimension
             compute_context: MSDComputeContext or None
+            return_bsd_metadata: bool — if True, also return BSDMetadata
         Returns:
             result: (N, out) float32
+            [bsd_meta]: BSDMetadata (only if return_bsd_metadata=True)
         """
         cfg = self._msd_config
         nb = x_q.shape[1]
@@ -643,9 +855,111 @@ class _MXFPLinearBase(nn.Module):
 
         # 10. Final summation across blocks
         result = (block_dots * combined_scales).sum(dim=-1)  # (N, out)
+
+        if return_bsd_metadata:
+            bsd_meta = _extract_bsd_metadata(result, b_final, inter_delays, online_delay)
+            return result, bsd_meta
         return result
 
-    def forward(self, x: torch.Tensor, compute_context=None) -> torch.Tensor:
+    def _forward_msd_truncated_bsd_input(
+        self, x, x_bsd, w_q, w_scales, N, compute_context,
+    ):
+        """
+        MSD-first truncated dot-product with BSD-precision-limited input.
+
+        Variant of _forward_msd_truncated for down_proj in BSD-penetration mode.
+        The input `x` retains its BSD-limited precision from pipeline stages
+        (SiLU, gating multiply) — it is NOT re-quantized to the MXFP format.
+        Instead, block scales are computed from actual values but elements keep
+        their precision-limited representation.
+
+        The effective precision of each product element is capped by both the
+        cycle budget and the input element's remaining BSD precision:
+            p_eff[n,j,b,k] = min(
+                B[n,j] - inter_delay[n,j,b] - intra_delay[n,b,k] - δ,
+                bsd_precision[n, b*bs+k]
+            )
+
+        Args:
+            x:      (N, dim) float32 — input values (gating output, BSD-limited)
+            x_bsd:  BSDMetadata — per-element BSD metadata from gating
+            w_q:    (out, nb, bs) quantized weight blocks (float32)
+            w_scales: (out, nb) weight block shared scales
+            N:      batch dimension
+            compute_context: MSDComputeContext or None
+        Returns:
+            result: (N, out) float32
+        """
+        cfg = self._msd_config
+        bs = self.block_size
+        online_delay = cfg.msd_online_delay
+
+        # Reshape input into blocks WITHOUT MXFP re-quantization.
+        # We compute block scales from actual values (needed for inter-block delays)
+        # but keep the original values (they already carry BSD precision limits).
+        feat = x.shape[-1]
+        pad_len = (-feat) % bs
+        x_padded = F.pad(x, (0, pad_len)) if pad_len else x
+        nb = x_padded.shape[-1] // bs
+        x_blocks = x_padded.view(N, nb, bs)  # (N, nb, bs)
+
+        # Compute block scales from actual input magnitudes (for inter-block alignment)
+        x_scales = x_blocks.abs().amax(dim=-1).clamp(min=1e-30)  # (N, nb)
+
+        # Pad precision tensor to match
+        if pad_len:
+            precision_padded = F.pad(x_bsd.precision, (0, pad_len))
+        else:
+            precision_padded = x_bsd.precision
+        precision_blocks = precision_padded.view(N, nb, bs)  # (N, nb, bs)
+
+        out = w_q.shape[0]
+
+        # 1. Inter-block delays: (N, out, nb)
+        inter_delays, _ = _compute_inter_block_delays(w_scales, x_scales)
+
+        # 2. Intra-block delays from input element exponents: (N, nb, bs)
+        intra_delays = _compute_intra_block_delays(x_blocks)
+
+        # 3. Per-channel budget: (N, out)
+        b_final = self._resolve_channel_budgets(compute_context, x_scales, w_scales, N)
+
+        # 4. Element-wise products: (N, out, nb, bs)
+        prods = x_blocks.unsqueeze(1) * w_q.unsqueeze(0)
+
+        # 5. Total delay: (N, out, nb, bs)
+        total_delay = (
+            inter_delays.unsqueeze(-1)
+            + intra_delays.unsqueeze(1)
+            + online_delay
+        )
+
+        # 6. Effective precision, capped by input BSD precision
+        # Standard budget-limited precision
+        p_eff_budget = b_final.unsqueeze(-1).unsqueeze(-1) - total_delay
+        p_eff_budget = torch.clamp(p_eff_budget, min=0.0)
+
+        # Input precision cap: (N, nb, bs) -> (N, 1, nb, bs)
+        p_eff_input = precision_blocks.unsqueeze(1)
+
+        # Final effective precision: minimum of budget and input precision
+        p_eff = torch.minimum(p_eff_budget, p_eff_input)
+
+        # 7. Truncate products
+        prods_trunc = _msd_truncate(prods, p_eff)
+
+        # 8. Sum within blocks: (N, out, nb)
+        block_dots = prods_trunc.sum(dim=-1)
+
+        # 9. Apply shared scales
+        combined_scales = x_scales.unsqueeze(1) * w_scales.unsqueeze(0)
+
+        # 10. Final summation
+        result = (block_dots * combined_scales).sum(dim=-1)  # (N, out)
+        return result
+
+    def forward(self, x: torch.Tensor, compute_context=None,
+                return_bsd_metadata=False, input_bsd=None) -> torch.Tensor:
         """
         MX-format block-wise forward pass.
 
@@ -654,6 +968,13 @@ class _MXFPLinearBase(nn.Module):
 
         When use_msd_truncation is enabled, uses time-domain truncated dot-product
         with two-level delays and cycle budgeting.
+
+        Args:
+            x: input tensor
+            compute_context: MSDComputeContext or None
+            return_bsd_metadata: bool — if True, also return BSDMetadata for output
+            input_bsd: BSDMetadata or None — if provided, use BSD-input path
+                       (skip MXFP re-quantization of input, cap precision by input BSD)
         """
         orig_dtype  = x.dtype
         batch_shape = x.shape[:-1]
@@ -662,18 +983,28 @@ class _MXFPLinearBase(nn.Module):
         x_2d = x.float().reshape(N, self.in_features)   # (N, in)
         w_2d = self.weight.float()                       # (out, in)
 
-        x_q, x_scales, _ = self._prepare_blocks(x_2d, N)                # (N,   nb, bs), (N,   nb)
-        w_q, w_scales, _ = self._prepare_blocks(w_2d, self.out_features) # (out, nb, bs), (out, nb)
+        # Always prepare weight blocks (needed in all paths)
+        w_q, w_scales, _ = self._prepare_blocks(w_2d, self.out_features)  # (out, nb, bs), (out, nb)
 
         use_msd = getattr(self._msd_config, "use_msd_truncation", False) if self._msd_config else False
 
-        if use_msd:
-            # MSD-first truncated dot-product path
-            result = self._forward_msd_truncated(
-                x_q, x_scales, w_q, w_scales, N, compute_context
+        if use_msd and input_bsd is not None:
+            # BSD-input path: skip MXFP re-quantization of input
+            result = self._forward_msd_truncated_bsd_input(
+                x_2d, input_bsd, w_q, w_scales, N, compute_context,
             )
+        elif use_msd:
+            # Standard MSD-first truncated dot-product path
+            x_q, x_scales, _ = self._prepare_blocks(x_2d, N)
+            result = self._forward_msd_truncated(
+                x_q, x_scales, w_q, w_scales, N, compute_context,
+                return_bsd_metadata=return_bsd_metadata,
+            )
+            if return_bsd_metadata:
+                result, bsd_meta = result
         else:
             # Standard exact MX block-wise matmul path
+            x_q, x_scales, _ = self._prepare_blocks(x_2d, N)
             elem_dots = torch.bmm(
                 x_q.permute(1, 0, 2),   # (nb, N,  bs)
                 w_q.permute(1, 2, 0),   # (nb, bs, out)
@@ -686,7 +1017,11 @@ class _MXFPLinearBase(nn.Module):
         if self.bias_param is not None:
             result = result + self.bias_param
 
-        return result.view(*batch_shape, self.out_features).to(orig_dtype)
+        out = result.view(*batch_shape, self.out_features).to(orig_dtype)
+
+        if return_bsd_metadata and use_msd and input_bsd is None:
+            return out, bsd_meta
+        return out
 
 
 # ── Format-specific subclasses ────────────────────────────────────────────────
@@ -810,52 +1145,107 @@ class Qwen3MLP(nn.Module):
 
     def forward(self, x, compute_context=None):
         use_msd = getattr(self.config, "use_msd_truncation", False)
+        use_bsd_pen = getattr(self.config, "msd_bsd_penetration", False)
         use_pipeline = getattr(self.config, "msd_deep_pipeline", False)
 
-        if use_msd and use_pipeline and compute_context is not None:
-            # Deep pipeline: track precision through gate->silu->*up->down
+        if use_msd and (use_bsd_pen or use_pipeline) and compute_context is not None:
             cfg = self.config
-
-            # Stage 1: gate_proj and up_proj (independent, parallel dot-products)
-            gate_out = self.gate_proj(x, compute_context=compute_context)
-            up_out = self.up_proj(x, compute_context=compute_context)
-
-            # Effective output precision from dot-products: use the budget as proxy
-            # (the minimum effective precision across blocks/elements per channel)
-            p_gate = float(cfg.msd_cycle_budget)
-            p_up = float(cfg.msd_cycle_budget)
-            if compute_context is not None and compute_context.pipeline_precision_remaining is not None:
-                p_gate = compute_context.pipeline_precision_remaining
-                p_up = compute_context.pipeline_precision_remaining
-
-            # Stage 2: SiLU on gate output (precision loss from nonlinear MSD eval)
-            precision_loss = cfg.msd_pipeline_precision_loss
-            if isinstance(p_gate, (int, float)):
-                p_after_silu = max(0, p_gate - precision_loss)
-            else:
-                p_after_silu = torch.clamp(p_gate - precision_loss, min=0.0)
-            silu_out = _msd_silu(gate_out, p_after_silu)
-
-            # Stage 3: element-wise multiply (online multiplier delay)
             online_delay = cfg.msd_online_delay
-            if isinstance(p_after_silu, (int, float)):
-                p_after_mul = max(0, min(p_after_silu, p_up) - online_delay)
-            else:
-                p_after_mul = torch.clamp(
-                    torch.minimum(p_after_silu, p_up) - online_delay, min=0.0
-                ) if not isinstance(p_up, (int, float)) else torch.clamp(
-                    p_after_silu - online_delay, min=0.0
-                )
-            intermediate = _msd_elementwise_mul(silu_out, up_out, p_after_mul)
+            n_segments = getattr(cfg, "msd_silu_pwl_segments", 8)
 
-            # Stage 4: down_proj with reduced input precision
-            compute_context.pipeline_precision_remaining = p_after_mul
-            result = self.down_proj(intermediate, compute_context=compute_context)
-            # Reset pipeline state after completing the MLP
-            compute_context.pipeline_precision_remaining = None
-            return result
+            if use_pipeline:
+                # ── Mode 2: Deep pipeline ────────────────────────────────
+                # Unified pipeline budget governs gate_proj→SiLU→gating as
+                # a single time-domain unit. down_proj gets independent budget.
+                #
+                # Cycle allocation:
+                #   T_gemm = B_pipe - silu_latency - online_delay
+                #   gate_proj and up_proj each receive T_gemm as cycle budget
+                #   SiLU consumes silu_latency from gate_proj output precision
+                #   Gating multiply consumes online_delay
+                silu_latency = _SILU_PWL_LATENCY_CYCLES
+                pipeline_budget = getattr(cfg, "msd_pipeline_budget", 24)
+
+                # Effective GEMM budget: pipeline budget minus SiLU and gating overhead
+                t_gemm = max(1, pipeline_budget - silu_latency - online_delay)
+
+                # Temporarily override cycle budget for gate/up projections
+                saved_budget = cfg.msd_cycle_budget
+                cfg.msd_cycle_budget = t_gemm
+                # Invalidate cached channel budgets for this layer's gate/up projections
+                if hasattr(compute_context, '_pipeline_budget_override'):
+                    compute_context._pipeline_budget_override = t_gemm
+
+                try:
+                    # Stage 1: gate_proj and up_proj with pipeline-derived budget
+                    gate_out, gate_bsd = self.gate_proj(
+                        x, compute_context=compute_context, return_bsd_metadata=True,
+                    )
+                    up_out, up_bsd = self.up_proj(
+                        x, compute_context=compute_context, return_bsd_metadata=True,
+                    )
+                finally:
+                    cfg.msd_cycle_budget = saved_budget
+
+                # Stage 2: PWL SiLU on gate output
+                silu_out, silu_bsd = _msd_silu_pwl(
+                    gate_out.float().reshape(-1, gate_out.shape[-1]),
+                    gate_bsd, n_segments=n_segments, online_delay=online_delay,
+                )
+
+                # Stage 3: Gating multiply
+                up_flat = up_out.float().reshape(-1, up_out.shape[-1])
+                gating_out, gating_bsd = _msd_gating_mul(
+                    silu_out, silu_bsd, up_flat, up_bsd,
+                    online_delay=online_delay,
+                )
+
+                # Stage 4: down_proj with independent budget and BSD-precision input
+                result = self.down_proj(
+                    gating_out.view(x.shape[:-1] + (gating_out.shape[-1],)).to(x.dtype),
+                    compute_context=compute_context,
+                    input_bsd=gating_bsd,
+                )
+                return result
+
+            else:
+                # ── Mode 1: BSD penetration (no deep pipeline) ───────────
+                # Each step has its own independent budget, but data stays in
+                # BSD representation (no MXFP re-quantization between steps).
+                # SiLU uses PWL approximation with proper cycle cost modeling.
+
+                # Stage 1: gate_proj and up_proj with standard MSD budgets
+                gate_out, gate_bsd = self.gate_proj(
+                    x, compute_context=compute_context, return_bsd_metadata=True,
+                )
+                up_out, up_bsd = self.up_proj(
+                    x, compute_context=compute_context, return_bsd_metadata=True,
+                )
+
+                # Stage 2: PWL SiLU on gate output
+                silu_out, silu_bsd = _msd_silu_pwl(
+                    gate_out.float().reshape(-1, gate_out.shape[-1]),
+                    gate_bsd, n_segments=n_segments, online_delay=online_delay,
+                )
+
+                # Stage 3: Gating multiply
+                up_flat = up_out.float().reshape(-1, up_out.shape[-1])
+                gating_out, gating_bsd = _msd_gating_mul(
+                    silu_out, silu_bsd, up_flat, up_bsd,
+                    online_delay=online_delay,
+                )
+
+                # Stage 4: down_proj with BSD-precision input
+                result = self.down_proj(
+                    gating_out.view(x.shape[:-1] + (gating_out.shape[-1],)).to(x.dtype),
+                    compute_context=compute_context,
+                    input_bsd=gating_bsd,
+                )
+                return result
+
         elif use_msd:
-            # MSD truncation without deep pipeline: standard structure, pass context
+            # MSD truncation without BSD penetration: standard structure, pass context
+            # (per-GEMM MSD truncation, exact fp16 SiLU and gating between GEMMs)
             gate_out = self.gate_proj(x, compute_context=compute_context)
             up_out = self.up_proj(x, compute_context=compute_context)
             intermediate = self.act_fn(gate_out) * up_out
@@ -984,6 +1374,9 @@ class Qwen3ForCausalLM(Qwen2ForCausalLM):
             getattr(cfg, "msd_budget_dynamic_threshold", 0.0),
             getattr(cfg, "msd_budget_dynamic_mode", "linear"),
             getattr(cfg, "msd_deep_pipeline", False),
+            getattr(cfg, "msd_bsd_penetration", False),
+            getattr(cfg, "msd_pipeline_budget", 24),
+            getattr(cfg, "msd_silu_pwl_segments", 8),
             getattr(cfg, "msd_pipeline_precision_loss", 2),
             id(getattr(cfg, "msd_calibration_data", None)),
         )
