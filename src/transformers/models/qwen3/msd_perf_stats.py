@@ -120,6 +120,7 @@ class _LayerAccumulator:
         self.total_elements = torch.zeros(out_features, dtype=torch.int64, device=device)
         self.total_blocks = torch.zeros(out_features, dtype=torch.int64, device=device)
         self.num_samples = 0  # total N across all forward calls
+        self.in_features = 0
 
 
 class MSDPerfAccumulator:
@@ -280,6 +281,7 @@ class MSDPerfAccumulator:
         acc.total_elements[j0:j1] += n_elements
         acc.total_blocks[j0:j1] += N * nb
         acc.num_samples += N
+        acc.in_features = nb * bs
 
         del p_flat_d
 
@@ -307,6 +309,7 @@ class MSDPerfAccumulator:
         new_acc.total_elements[:o] = old.total_elements
         new_acc.total_blocks[:o] = old.total_blocks
         new_acc.num_samples = old.num_samples
+        new_acc.in_features = old.in_features
         self._layers[layer_name] = new_acc
         return new_acc
 
@@ -348,6 +351,7 @@ class MSDPerfAccumulator:
         g_p_eff_sum = 0.0
         g_active_p_eff_sum = 0.0
         g_total_budget = 0.0
+        g_budget_mac_capacity = 0.0
         g_effective_cycles = 0.0
         g_total_blocks = 0
         g_zero_blocks = 0
@@ -370,6 +374,7 @@ class MSDPerfAccumulator:
             g_p_eff_sum += acc.p_eff_sum.sum().item()
             g_active_p_eff_sum += acc.active_p_eff_sum.sum().item()
             g_total_budget += acc.total_budget_sum.sum().item()
+            g_budget_mac_capacity += acc.total_budget_sum.sum().item() * acc.in_features
             g_effective_cycles += acc.effective_cycles_sum.sum().item()
             g_total_blocks += acc.total_blocks.sum().item()
             g_zero_blocks += acc.block_zero_count.sum().item()
@@ -400,7 +405,7 @@ class MSDPerfAccumulator:
             # Channel level (model-wide)
             "total_budget_cycles": round(g_total_budget, 1),
             "effective_cycles": round(g_effective_cycles, 1),
-            "global_utilization": round(g_effective_cycles / max(g_total_budget, 1e-30), 6),
+            "global_utilization": round(g_effective_cycles / max(g_budget_mac_capacity, 1e-30), 6),
             # Block level (model-wide)
             "total_blocks": g_total_blocks,
             "zero_blocks": g_zero_blocks,
@@ -438,9 +443,11 @@ class MSDPerfAccumulator:
 
         total_blk = acc.total_blocks.float().clamp(min=1)
         total_blk_sum = acc.total_blocks.sum().float().clamp(min=1)
+        total_instances = max(acc.num_samples * acc.out, 1)
         partial_safe = acc.block_partial_count.clamp(min=1).float()
 
-        budget_safe = acc.total_budget_sum.clamp(min=1e-30)
+        budget_mac_capacity = acc.total_budget_sum * acc.in_features
+        budget_safe = budget_mac_capacity.clamp(min=1e-30)
         utilization_ch = (acc.effective_cycles_sum / budget_safe).float()  # (out,)
 
         mac_sparsity_ch = (acc.zero_element_count.float() / total_elem_safe)  # (out,)
@@ -482,7 +489,7 @@ class MSDPerfAccumulator:
             },
             "channel_level": {
                 "budget_mean": round(float(
-                    acc.total_budget_sum.sum() / total_blk_sum
+                    acc.total_budget_sum.sum() / total_instances
                 ), 2),
                 "effective_cycles_total": round(float(acc.effective_cycles_sum.sum()), 1),
                 "utilization_mean": round(float(utilization_ch.mean()), 6),
@@ -531,7 +538,7 @@ class MSDPerfAccumulator:
                     "total_budget_cycles": acc.total_budget_sum.float().cpu().tolist(),
                     "effective_cycles": acc.effective_cycles_sum.float().cpu().tolist(),
                     "skipped_cycles": (
-                        acc.total_budget_sum - acc.effective_cycles_sum
+                        budget_mac_capacity - acc.effective_cycles_sum
                     ).clamp(min=0).float().cpu().tolist(),
                     "utilization": utilization_ch.cpu().tolist(),
                     "max_budget": acc.max_budget.cpu().tolist(),
