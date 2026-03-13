@@ -263,13 +263,10 @@ def _compute_naf_widths(value):
         naf_width: int32 tensor, same shape as value
     """
     with torch.no_grad():
-        abs_v = value.abs()
-        # Scale to integer mantissa with MSB near bit-23
-        msb_pos = torch.floor(torch.log2(abs_v.clamp(min=1e-45)))
-        scale_up = torch.pow(2.0, 23.0 - msb_pos)
-        del msb_pos
-        x_scaled = torch.round(abs_v * scale_up).to(torch.int32)
-        del abs_v, scale_up
+        mantissa, _ = torch.frexp(value.abs())
+        # Scale to integer mantissa, pushing MSB to bit 23
+        x_scaled = torch.round(mantissa * (1 << 24)).to(torch.int32)
+        del mantissa
 
         # NAF conversion
         x_h = x_scaled >> 1

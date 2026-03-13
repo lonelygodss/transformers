@@ -119,6 +119,7 @@ class _LayerAccumulator:
         # ── Counting ──
         self.total_elements = torch.zeros(out_features, dtype=torch.int64, device=device)
         self.total_blocks = torch.zeros(out_features, dtype=torch.int64, device=device)
+        self.in_features = 0
         self.num_samples = 0  # total N across all forward calls
 
 
@@ -279,6 +280,7 @@ class MSDPerfAccumulator:
         n_elements = N * nb * bs
         acc.total_elements[j0:j1] += n_elements
         acc.total_blocks[j0:j1] += N * nb
+        acc.in_features = nb * bs
         acc.num_samples += N
 
         del p_flat_d
@@ -306,6 +308,7 @@ class MSDPerfAccumulator:
         new_acc.completed_element_count[:o] = old.completed_element_count
         new_acc.total_elements[:o] = old.total_elements
         new_acc.total_blocks[:o] = old.total_blocks
+        new_acc.in_features = old.in_features
         new_acc.num_samples = old.num_samples
         self._layers[layer_name] = new_acc
         return new_acc
@@ -369,7 +372,7 @@ class MSDPerfAccumulator:
             g_active_elements += acc.active_element_count.sum().item()
             g_p_eff_sum += acc.p_eff_sum.sum().item()
             g_active_p_eff_sum += acc.active_p_eff_sum.sum().item()
-            g_total_budget += acc.total_budget_sum.sum().item()
+            g_total_budget += acc.total_budget_sum.sum().item() * acc.in_features
             g_effective_cycles += acc.effective_cycles_sum.sum().item()
             g_total_blocks += acc.total_blocks.sum().item()
             g_zero_blocks += acc.block_zero_count.sum().item()
@@ -440,7 +443,9 @@ class MSDPerfAccumulator:
         total_blk_sum = acc.total_blocks.sum().float().clamp(min=1)
         partial_safe = acc.block_partial_count.clamp(min=1).float()
 
-        budget_safe = acc.total_budget_sum.clamp(min=1e-30)
+        # Multiply by in_features to get max possible MAC-cycles capacity
+        budget_mac_capacity_ch = acc.total_budget_sum * max(1, acc.in_features)
+        budget_safe = budget_mac_capacity_ch.clamp(min=1e-30)
         utilization_ch = (acc.effective_cycles_sum / budget_safe).float()  # (out,)
 
         mac_sparsity_ch = (acc.zero_element_count.float() / total_elem_safe)  # (out,)
@@ -455,6 +460,9 @@ class MSDPerfAccumulator:
         # Normalize by bs: total_elements[0] / total_blocks[0] = bs
         bs_est = (total_elem[0] / acc.total_blocks[0].float()).item() if acc.total_blocks[0] > 0 else 1.0
         partial_active_frac_ch = partial_active_frac_ch / bs_est  # fraction in [0, 1]
+
+        # Total number of occurrences (sum of N out over which budget is summed)
+        total_instances = max(1, int(total_elem.sum().item() / max(1, acc.in_features)))
 
         # ── Build compact SUMMARY (always) ──────────────────────────
         summary = {
@@ -482,7 +490,7 @@ class MSDPerfAccumulator:
             },
             "channel_level": {
                 "budget_mean": round(float(
-                    acc.total_budget_sum.sum() / total_blk_sum
+                    acc.total_budget_sum.sum() / total_instances
                 ), 2),
                 "effective_cycles_total": round(float(acc.effective_cycles_sum.sum()), 1),
                 "utilization_mean": round(float(utilization_ch.mean()), 6),
@@ -528,10 +536,11 @@ class MSDPerfAccumulator:
                     "partial_block_active_frac": partial_active_frac_ch.cpu().tolist(),
                 },
                 "channel_level": {
-                    "total_budget_cycles": acc.total_budget_sum.float().cpu().tolist(),
+                    "total_budget_cycles": budget_mac_capacity_ch.float().cpu().tolist(),
+                    "total_latency_budget_sum": acc.total_budget_sum.float().cpu().tolist(),
                     "effective_cycles": acc.effective_cycles_sum.float().cpu().tolist(),
                     "skipped_cycles": (
-                        acc.total_budget_sum - acc.effective_cycles_sum
+                        budget_mac_capacity_ch - acc.effective_cycles_sum
                     ).clamp(min=0).float().cpu().tolist(),
                     "utilization": utilization_ch.cpu().tolist(),
                     "max_budget": acc.max_budget.cpu().tolist(),
