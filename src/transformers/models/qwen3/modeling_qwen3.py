@@ -1384,6 +1384,17 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def apply_baseline_sparsity(self, mask_dict):
+        """
+        Injects zeros into model weights using the given mask dictionary
+        so that inference is just standard calculation.
+        mask_dict is a dict mapping layer names to binary mask tensors.
+        """
+        for name, module in self.named_modules():
+            if name in mask_dict and hasattr(module, "weight"):
+                mask = mask_dict[name].to(module.weight.device)
+                module.weight.data.mul_(mask)
+
     @can_return_tuple
     @auto_docstring
     def forward(
