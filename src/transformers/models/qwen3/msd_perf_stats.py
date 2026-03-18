@@ -70,57 +70,49 @@ class _LayerAccumulator:
 
     All tensors are 1D of shape (out_features,) or (out_features, num_bins),
     stored in float64/int64 for numerical stability across many forward passes.
+
+    When ``lite=True``, only the fields needed for lite metrics are allocated:
+    utilization, zero-block ratio, sparsity, max latency, and mean p_eff.
     """
 
-    def __init__(self, out_features: int, device: torch.device):
+    def __init__(self, out_features: int, device: torch.device, lite: bool = False):
         self.out = out_features
         self.device = device
+        self.lite = lite
 
-        # ── Bit level: effective precision distribution ──
+        # ── Always-needed fields ──
+
+        # Bit level: mean effective precision (needed even in lite for global avg p_eff)
         self.p_eff_sum = torch.zeros(out_features, dtype=torch.float64, device=device)
-        self.p_eff_sq_sum = torch.zeros(out_features, dtype=torch.float64, device=device)
-        self.p_eff_hist = torch.zeros(out_features, _NUM_BINS, dtype=torch.int64, device=device)
 
-        # ── Bit level (active-only): conditional p_eff for elements where p_eff > 0 ──
-        self.active_p_eff_sum = torch.zeros(out_features, dtype=torch.float64, device=device)
+        # MAC level: element-wise sparsity
+        self.zero_element_count = torch.zeros(out_features, dtype=torch.int64, device=device)
         self.active_element_count = torch.zeros(out_features, dtype=torch.int64, device=device)
 
-        # ── Block level: activation categories ──
-        # At block granularity:
-        #   "zero"    — ALL bs elements have p_eff == 0  (no work done)
-        #   "full"    — ALL bs elements completed: p_eff >= naf_width (every MAC finished)
-        #   "partial" — neither zero nor full (some elements truncated by budget)
+        # Block level: zero-block count (always needed)
         self.block_zero_count = torch.zeros(out_features, dtype=torch.int64, device=device)
-        self.block_partial_count = torch.zeros(out_features, dtype=torch.int64, device=device)
-        self.block_full_count = torch.zeros(out_features, dtype=torch.int64, device=device)
 
-        # ── Block level (partial-block detail): active element count within partial blocks ──
-        # Used to compute mean active fraction within partial blocks.
-        self.partial_block_active_elem_sum = torch.zeros(out_features, dtype=torch.int64, device=device)
-
-        # ── Channel level: cycle accounting ──
-        # total_budget_cycles = sum of b_final[n,j] across all N samples
-        # effective_cycles = sum of p_eff across all elements (total "work done")
+        # Channel level: cycle accounting & latency
         self.total_budget_sum = torch.zeros(out_features, dtype=torch.float64, device=device)
         self.effective_cycles_sum = torch.zeros(out_features, dtype=torch.float64, device=device)
-
-        # ── Channel level: max latency indicators ──
-        # max_budget = running max of b_final[n,j] per channel across all samples
-        # max_total_delay = running max of total_delay per channel across all (n,b,k)
         self.max_budget = torch.zeros(out_features, dtype=torch.float32, device=device)
         self.max_total_delay = torch.zeros(out_features, dtype=torch.float32, device=device)
 
-        # ── MAC level: element-wise sparsity & completion ──
-        # zero_element_count = number of elements with p_eff == 0 (fully skipped MACs)
-        # completed_element_count = number of elements with p_eff >= naf_width (fully finished MACs)
-        self.zero_element_count = torch.zeros(out_features, dtype=torch.int64, device=device)
-        self.completed_element_count = torch.zeros(out_features, dtype=torch.int64, device=device)
-
-        # ── Counting ──
+        # Counting
         self.total_elements = torch.zeros(out_features, dtype=torch.int64, device=device)
         self.total_blocks = torch.zeros(out_features, dtype=torch.int64, device=device)
         self.in_features = 0
         self.num_samples = 0  # total N across all forward calls
+
+        # ── Full-mode-only fields ──
+        if not lite:
+            self.p_eff_sq_sum = torch.zeros(out_features, dtype=torch.float64, device=device)
+            self.p_eff_hist = torch.zeros(out_features, _NUM_BINS, dtype=torch.int64, device=device)
+            self.active_p_eff_sum = torch.zeros(out_features, dtype=torch.float64, device=device)
+            self.block_partial_count = torch.zeros(out_features, dtype=torch.int64, device=device)
+            self.block_full_count = torch.zeros(out_features, dtype=torch.int64, device=device)
+            self.partial_block_active_elem_sum = torch.zeros(out_features, dtype=torch.int64, device=device)
+            self.completed_element_count = torch.zeros(out_features, dtype=torch.int64, device=device)
 
 
 class MSDPerfAccumulator:
@@ -138,14 +130,15 @@ class MSDPerfAccumulator:
     Thread-safety: NOT thread-safe (same as MSDComputeContext — one per process).
     """
 
-    def __init__(self):
+    def __init__(self, lite: bool = False):
+        self.lite = lite
         self._layers: dict[str, _LayerAccumulator] = {}
         self._bin_edges_cache: dict[torch.device, torch.Tensor] = {}
 
     def _get_or_create_layer(self, layer_name: str, out_features: int, device: torch.device) -> _LayerAccumulator:
         """Get existing accumulator or create a new one for this layer."""
         if layer_name not in self._layers:
-            self._layers[layer_name] = _LayerAccumulator(out_features, device)
+            self._layers[layer_name] = _LayerAccumulator(out_features, device, lite=self.lite)
         return self._layers[layer_name]
 
     def _get_bin_edges(self, device: torch.device) -> torch.Tensor:
@@ -191,6 +184,13 @@ class MSDPerfAccumulator:
                        When provided, enables correct full/partial block classification
                        (full = every element completed, not just active).
         """
+        if self.lite:
+            return self._record_chunk_lite(
+                layer_name, p_eff, b_final_c, j0, j1, N, nb, bs,
+                max_delay_chunk=max_delay_chunk,
+                max_budget_chunk=max_budget_chunk,
+            )
+
         c = j1 - j0
         device = p_eff.device
 
@@ -285,31 +285,95 @@ class MSDPerfAccumulator:
 
         del p_flat_d
 
+    def _record_chunk_lite(
+        self,
+        layer_name: str,
+        p_eff: torch.Tensor,
+        b_final_c: torch.Tensor,
+        j0: int,
+        j1: int,
+        N: int,
+        nb: int,
+        bs: int,
+        *,
+        max_delay_chunk: torch.Tensor | None = None,
+        max_budget_chunk: torch.Tensor | None = None,
+    ):
+        """
+        Lite fast path for record_chunk — only collects metrics needed for
+        utilization, zero-block ratio, mean p_eff, sparsity, and max latency.
+
+        Skips: histogram, p_eff variance, active-only p_eff, partial/full
+        block classification, completed element counting, and NAF widths.
+        """
+        c = j1 - j0
+        device = p_eff.device
+
+        acc = self._layers.get(layer_name)
+        if acc is None:
+            acc = _LayerAccumulator(j1, device, lite=True)
+            self._layers[layer_name] = acc
+        elif j1 > acc.out:
+            acc = self._grow_accumulator(layer_name, j1, device)
+
+        p_flat = p_eff.reshape(N, c, nb * bs)  # (N, c, nb*bs)
+
+        # p_eff sum for mean effective precision
+        acc.p_eff_sum[j0:j1] += p_flat.double().sum(dim=(0, 2))
+
+        # Active / zero element counts
+        active_mask = p_flat > 0  # (N, c, nb*bs) bool
+        acc.active_element_count[j0:j1] += active_mask.sum(dim=(0, 2)).long()
+        acc.zero_element_count[j0:j1] += (~active_mask).sum(dim=(0, 2)).long()
+
+        # Zero-block count: block is zero when ALL bs elements have p_eff == 0
+        block_any_active = active_mask.reshape(N, c, nb, bs).any(dim=-1)  # (N, c, nb)
+        acc.block_zero_count[j0:j1] += (~block_any_active).sum(dim=(0, 2)).long()
+        del active_mask, block_any_active
+
+        # Channel level: budget and effective cycles
+        acc.total_budget_sum[j0:j1] += b_final_c.double().sum(dim=0)
+        acc.effective_cycles_sum[j0:j1] += p_flat.double().sum(dim=(0, 2))
+
+        # Running max latency indicators
+        if max_budget_chunk is not None:
+            torch.maximum(acc.max_budget[j0:j1], max_budget_chunk, out=acc.max_budget[j0:j1])
+        if max_delay_chunk is not None:
+            torch.maximum(acc.max_total_delay[j0:j1], max_delay_chunk, out=acc.max_total_delay[j0:j1])
+
+        # Counting
+        acc.total_elements[j0:j1] += N * nb * bs
+        acc.total_blocks[j0:j1] += N * nb
+        acc.in_features = nb * bs
+        acc.num_samples += N
+
     def _grow_accumulator(self, layer_name: str, new_out: int, device: torch.device) -> _LayerAccumulator:
         """Grow an existing accumulator to accommodate more output channels."""
         old = self._layers[layer_name]
-        new_acc = _LayerAccumulator(new_out, device)
+        new_acc = _LayerAccumulator(new_out, device, lite=old.lite)
         o = old.out
-        # Copy existing data
+        # Copy always-present fields
         new_acc.p_eff_sum[:o] = old.p_eff_sum
-        new_acc.p_eff_sq_sum[:o] = old.p_eff_sq_sum
-        new_acc.p_eff_hist[:o] = old.p_eff_hist
-        new_acc.active_p_eff_sum[:o] = old.active_p_eff_sum
         new_acc.active_element_count[:o] = old.active_element_count
+        new_acc.zero_element_count[:o] = old.zero_element_count
         new_acc.block_zero_count[:o] = old.block_zero_count
-        new_acc.block_partial_count[:o] = old.block_partial_count
-        new_acc.block_full_count[:o] = old.block_full_count
-        new_acc.partial_block_active_elem_sum[:o] = old.partial_block_active_elem_sum
         new_acc.total_budget_sum[:o] = old.total_budget_sum
         new_acc.effective_cycles_sum[:o] = old.effective_cycles_sum
         new_acc.max_budget[:o] = old.max_budget
         new_acc.max_total_delay[:o] = old.max_total_delay
-        new_acc.zero_element_count[:o] = old.zero_element_count
-        new_acc.completed_element_count[:o] = old.completed_element_count
         new_acc.total_elements[:o] = old.total_elements
         new_acc.total_blocks[:o] = old.total_blocks
         new_acc.in_features = old.in_features
         new_acc.num_samples = old.num_samples
+        # Copy full-mode-only fields
+        if not old.lite:
+            new_acc.p_eff_sq_sum[:o] = old.p_eff_sq_sum
+            new_acc.p_eff_hist[:o] = old.p_eff_hist
+            new_acc.active_p_eff_sum[:o] = old.active_p_eff_sum
+            new_acc.block_partial_count[:o] = old.block_partial_count
+            new_acc.block_full_count[:o] = old.block_full_count
+            new_acc.partial_block_active_elem_sum[:o] = old.partial_block_active_elem_sum
+            new_acc.completed_element_count[:o] = old.completed_element_count
         self._layers[layer_name] = new_acc
         return new_acc
 
@@ -317,7 +381,7 @@ class MSDPerfAccumulator:
     #  finalize — reduce accumulated stats into JSON-serializable output
     # ──────────────────────────────────────────────────────────────────────
 
-    def finalize(self, detail_layer: int = 2) -> dict:
+    def finalize(self, detail_layer: int = 2, online_delay: float = 0.0) -> dict:
         """
         Reduce all accumulated statistics to a JSON-serializable dict.
 
@@ -325,9 +389,15 @@ class MSDPerfAccumulator:
         every layer, and **per-channel detail arrays** only for layers whose
         name contains ``model.layers.<detail_layer>.``.
 
+        In lite mode, produces a slimmer structure with only the metrics
+        needed for utilization, sparsity, zero-block ratio, hw latency
+        overhead, and max latency.
+
         Args:
             detail_layer: transformer layer index whose sub-modules receive
-                full per-channel detail (default: 2).
+                full per-channel detail (default: 2).  Ignored in lite mode.
+            online_delay: msd_online_delay from config, used for hw_latency_overhead
+                computation in lite mode.
 
         Returns:
             {
@@ -341,6 +411,9 @@ class MSDPerfAccumulator:
                 }
             }
         """
+        if self.lite:
+            return self._finalize_lite(online_delay)
+
         detail_prefix = f"layers.{detail_layer}."
         per_layer = {}
 
@@ -387,7 +460,6 @@ class MSDPerfAccumulator:
         g_active_safe = max(g_active_elements, 1)
         g_blocks_safe = max(g_total_blocks, 1)
         g_active_macs = g_total_elements - g_zero_elements
-        g_partial_safe = max(g_partial_blocks, 1)
 
         global_stats = {
             "num_layers": len(self._layers),
@@ -420,6 +492,102 @@ class MSDPerfAccumulator:
         return {
             "global": global_stats,
             "per_layer": per_layer,
+        }
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  _finalize_lite — compact output for lite mode
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _finalize_lite(self, online_delay: float) -> dict:
+        """
+        Produce compact lite-mode output: utilization, hw latency overhead,
+        zero-block ratio, mean p_eff, mac sparsity, and max latency per layer.
+        """
+        per_layer = {}
+
+        g_total_elements = 0
+        g_zero_elements = 0
+        g_active_elements = 0
+        g_p_eff_sum = 0.0
+        g_total_budget = 0.0
+        g_effective_cycles = 0.0
+        g_total_blocks = 0
+        g_zero_blocks = 0
+        g_max_budget = 0.0
+        g_max_total_delay = 0.0
+
+        for layer_name, acc in self._layers.items():
+            per_layer[layer_name] = self._finalize_layer_lite(acc, online_delay)
+
+            g_total_elements += acc.total_elements.sum().item()
+            g_zero_elements += acc.zero_element_count.sum().item()
+            g_active_elements += acc.active_element_count.sum().item()
+            g_p_eff_sum += acc.p_eff_sum.sum().item()
+            g_total_budget += acc.total_budget_sum.sum().item() * acc.in_features
+            g_effective_cycles += acc.effective_cycles_sum.sum().item()
+            g_total_blocks += acc.total_blocks.sum().item()
+            g_zero_blocks += acc.block_zero_count.sum().item()
+            g_max_budget = max(g_max_budget, acc.max_budget.max().item())
+            g_max_total_delay = max(g_max_total_delay, acc.max_total_delay.max().item())
+
+        g_total_safe = max(g_total_elements, 1)
+        g_budget_safe = max(g_total_budget, 1e-30)
+        g_blocks_safe = max(g_total_blocks, 1)
+        g_utilization = g_effective_cycles / g_budget_safe
+        g_hw_overhead = (g_active_elements * online_delay) / g_budget_safe
+
+        global_stats = {
+            "num_layers": len(self._layers),
+            "total_macs": g_total_elements,
+            "mac_sparsity": round(g_zero_elements / g_total_safe, 6),
+            "mean_effective_precision": round(g_p_eff_sum / g_total_safe, 4),
+            "global_utilization": round(g_utilization, 6),
+            "hw_latency_overhead": round(g_hw_overhead, 6),
+            "zero_block_ratio": round(g_zero_blocks / g_blocks_safe, 6),
+            "max_budget": round(g_max_budget, 2),
+            "max_total_delay": round(g_max_total_delay, 2),
+        }
+
+        return {
+            "global": global_stats,
+            "per_layer": per_layer,
+        }
+
+    def _finalize_layer_lite(self, acc: _LayerAccumulator, online_delay: float) -> dict:
+        """Produce compact per-layer stats for lite mode."""
+        total_elem_sum = acc.total_elements.sum().float().clamp(min=1)
+        total_blk_sum = acc.total_blocks.sum().float().clamp(min=1)
+
+        # Utilization
+        budget_mac_capacity = acc.total_budget_sum.sum() * max(1, acc.in_features)
+        budget_safe = max(float(budget_mac_capacity), 1e-30)
+        effective = float(acc.effective_cycles_sum.sum())
+        utilization = effective / budget_safe
+
+        # HW latency overhead: active_count * online_delay / total_budget_capacity
+        active_count = float(acc.active_element_count.sum())
+        hw_overhead = (active_count * online_delay) / budget_safe
+
+        # Zero-block ratio
+        zero_blk = float(acc.block_zero_count.sum())
+        zero_blk_ratio = zero_blk / float(total_blk_sum)
+
+        # Mean p_eff
+        p_eff_mean = float(acc.p_eff_sum.sum()) / float(total_elem_sum)
+
+        # MAC sparsity
+        mac_sparsity = float(acc.zero_element_count.sum()) / float(total_elem_sum)
+
+        # Average max latency (mean of per-channel max budgets)
+        avg_max_latency = float(acc.max_budget.mean())
+
+        return {
+            "utilization": round(utilization, 6),
+            "hw_latency_overhead": round(hw_overhead, 6),
+            "zero_block_ratio": round(zero_blk_ratio, 6),
+            "p_eff_mean": round(p_eff_mean, 4),
+            "mac_sparsity": round(mac_sparsity, 6),
+            "avg_max_latency": round(avg_max_latency, 2),
         }
 
     def _finalize_layer(self, acc: _LayerAccumulator, want_detail: bool) -> dict:

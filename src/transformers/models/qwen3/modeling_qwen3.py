@@ -78,7 +78,11 @@ class MSDComputeContext:
         self.budget_dynamic_mode = config.msd_budget_dynamic_mode
         self.online_delay = config.msd_online_delay
         self.pipeline_precision_loss = config.msd_pipeline_precision_loss
-        self.perf_stats = MSDPerfAccumulator()
+
+        # Perf stats: can be disabled entirely or run in lite mode via config
+        perf_enabled = getattr(config, "msd_perf_stats_enabled", True)
+        perf_lite = getattr(config, "msd_perf_stats_lite", False)
+        self.perf_stats = MSDPerfAccumulator(lite=perf_lite) if perf_enabled else None
 
     @staticmethod
     def activate(ctx):
@@ -590,18 +594,21 @@ class _MXFPLinearBase(nn.Module):
             max_budget_chunk = b_final_c.amax(dim=0)            # (c,) max over N
             del total_delay  # free 4D tensor early
 
-            # 4b. Compute NAF widths of products for block-completion stats
-            naf_width = _compute_naf_widths(prods)  # (N, c, nb, bs) int32
-
-            # 4c. Record performance statistics (lightweight — no new large tensors)
-            if compute_context is not None and compute_context.perf_stats is not None:
-                compute_context.perf_stats.record_chunk(
+            # 4b. Record performance statistics
+            _perf = compute_context.perf_stats if compute_context is not None else None
+            if _perf is not None:
+                # Only compute NAF widths when full (non-lite) stats need them
+                # for block-completion classification.  This is the biggest perf
+                # win of lite mode: _compute_naf_widths duplicates most of the
+                # NAF conversion done inside _msd_truncate.
+                naf_width = _compute_naf_widths(prods) if not _perf.lite else None
+                _perf.record_chunk(
                     self.layer_name, p_eff, b_final_c, j0, j1, N, nb, bs,
                     max_delay_chunk=max_delay_chunk,
                     max_budget_chunk=max_budget_chunk,
                     naf_width=naf_width,
                 )
-            del naf_width
+                del naf_width
 
             # 5. Truncate products (BSD/NAF truncation)
             prods_trunc = _msd_truncate(prods, p_eff)
@@ -1489,6 +1496,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             getattr(cfg, "msd_deep_pipeline", False),
             getattr(cfg, "msd_pipeline_precision_loss", 2),
             id(getattr(cfg, "msd_calibration_data", None)),
+            getattr(cfg, "msd_perf_stats_enabled", True),
+            getattr(cfg, "msd_perf_stats_lite", False),
         )
         if self._msd_context is None or self._msd_context_config_hash != cfg_hash:
             self._msd_context = MSDComputeContext.create_from_config(cfg, self.model)
@@ -1503,13 +1512,17 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
                 full per-channel detail arrays (default: 2).  All other
                 layers only get compact scalar summaries.
         """
-        if self._msd_context is not None and self._msd_context.perf_stats.has_data:
-            return self._msd_context.perf_stats.finalize(detail_layer=detail_layer)
+        ctx = self._msd_context
+        if ctx is not None and ctx.perf_stats is not None and ctx.perf_stats.has_data:
+            return ctx.perf_stats.finalize(
+                detail_layer=detail_layer,
+                online_delay=getattr(self.config, "msd_online_delay", 0),
+            )
         return None
 
     def reset_perf_stats(self):
         """Clear accumulated MSD performance statistics."""
-        if self._msd_context is not None:
+        if self._msd_context is not None and self._msd_context.perf_stats is not None:
             self._msd_context.perf_stats.reset()
 
 
