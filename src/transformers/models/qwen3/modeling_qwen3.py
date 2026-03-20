@@ -78,6 +78,8 @@ class MSDComputeContext:
         self.budget_dynamic_mode = config.msd_budget_dynamic_mode
         self.online_delay = config.msd_online_delay
         self.pipeline_precision_loss = config.msd_pipeline_precision_loss
+        # Device cache for channel_budgets tensors (avoids CPU->GPU transfer each forward)
+        self._channel_budgets_device_cache = {}
 
         # Perf stats: can be disabled entirely or run in lite mode via config
         perf_enabled = getattr(config, "msd_perf_stats_enabled", True)
@@ -409,6 +411,9 @@ class _MXFPLinearBase(nn.Module):
             self.bias_param = nn.Parameter(torch.empty(out_features))
         else:
             self.register_parameter("bias_param", None)
+        # Weight quantization cache (avoids re-quantizing every forward pass)
+        self._w_cache = None
+        self._w_cache_data_ptr = None
 
     def _get_block_size(self, config) -> int:
         """Resolved by subclasses; fall back to 32."""
@@ -457,6 +462,14 @@ class _MXFPLinearBase(nn.Module):
         q, scales = self._quantize_to_blocks(blocks)
         return q, scales, pad_len
 
+    def _get_channel_budgets_cached(self, compute_context, device):
+        """Return channel_budgets for this layer on the given device, with caching."""
+        cache = compute_context._channel_budgets_device_cache
+        key = (self.layer_name, device)
+        if key not in cache:
+            cache[key] = compute_context.channel_budgets[self.layer_name].to(device)
+        return cache[key]
+
     def _resolve_channel_budgets(self, compute_context, x_scales, w_scales, N):
         """
         Resolve per-output-channel cycle budgets using hybrid Glocal budgeting
@@ -475,9 +488,23 @@ class _MXFPLinearBase(nn.Module):
             b_final: (N, out) per-sample, per-output-channel final budget
         """
         cfg = self._msd_config
+        alpha = cfg.msd_budget_dynamic_scale
+
+        # Fast path: when alpha==0 (default), delta_b is always zero.
+        # Skip allocating ~1 GB (N, out, nb) combined_log2 tensor.
+        if alpha == 0.0:
+            # Base budget per output channel
+            if compute_context is not None and self.layer_name in compute_context.channel_budgets:
+                b_base = self._get_channel_budgets_cached(compute_context, x_scales.device)
+            else:
+                b_base = torch.full(
+                    (self.out_features,), float(cfg.msd_cycle_budget), dtype=torch.float32, device=x_scales.device
+                )
+            return b_base.unsqueeze(0).expand(N, -1)  # view, no copy
+
         # Base budget per output channel
         if compute_context is not None and self.layer_name in compute_context.channel_budgets:
-            b_base = compute_context.channel_budgets[self.layer_name].to(x_scales.device)  # (out,)
+            b_base = self._get_channel_budgets_cached(compute_context, x_scales.device)
         else:
             b_base = torch.full(
                 (self.out_features,), float(cfg.msd_cycle_budget), dtype=torch.float32, device=x_scales.device
@@ -589,18 +616,11 @@ class _MXFPLinearBase(nn.Module):
             p_eff = b_final_c.unsqueeze(-1).unsqueeze(-1) - total_delay
             p_eff = torch.clamp(p_eff, min=0.0)
 
-            # 4a. Compute max latency metrics (cheap 1D reductions on existing tensors)
-            max_delay_chunk = total_delay.amax(dim=(0, 2, 3))  # (c,) max over N, nb, bs
-            max_budget_chunk = b_final_c.amax(dim=0)            # (c,) max over N
-            del total_delay  # free 4D tensor early
-
-            # 4b. Record performance statistics
+            # 4a. Record performance statistics (compute metrics only when needed)
             _perf = compute_context.perf_stats if compute_context is not None else None
             if _perf is not None:
-                # Only compute NAF widths when full (non-lite) stats need them
-                # for block-completion classification.  This is the biggest perf
-                # win of lite mode: _compute_naf_widths duplicates most of the
-                # NAF conversion done inside _msd_truncate.
+                max_delay_chunk = total_delay.amax(dim=(0, 2, 3))  # (c,) max over N, nb, bs
+                max_budget_chunk = b_final_c.amax(dim=0)            # (c,) max over N
                 naf_width = _compute_naf_widths(prods) if not _perf.lite else None
                 _perf.record_chunk(
                     self.layer_name, p_eff, b_final_c, j0, j1, N, nb, bs,
@@ -609,6 +629,7 @@ class _MXFPLinearBase(nn.Module):
                     naf_width=naf_width,
                 )
                 del naf_width
+            del total_delay  # free 4D tensor early
 
             # 5. Truncate products (BSD/NAF truncation)
             prods_trunc = _msd_truncate(prods, p_eff)
@@ -645,10 +666,19 @@ class _MXFPLinearBase(nn.Module):
         N = math.prod(batch_shape) if batch_shape else 1
 
         x_2d = x.float().reshape(N, self.in_features)  # (N, in)
-        w_2d = self.weight.float()  # (out, in)
 
         x_q, x_scales, _ = self._prepare_blocks(x_2d, N)  # (N,   nb, bs), (N,   nb)
-        w_q, w_scales, _ = self._prepare_blocks(w_2d, self.out_features)  # (out, nb, bs), (out, nb)
+
+        # Cache quantized weights: weights don't change during inference,
+        # so avoid re-quantizing ~48k times (84 layers x 578 windows).
+        w_data_ptr = self.weight.data.data_ptr()
+        if self._w_cache is None or self._w_cache_data_ptr != w_data_ptr:
+            w_2d = self.weight.float()  # (out, in)
+            w_q, w_scales, w_pad = self._prepare_blocks(w_2d, self.out_features)
+            self._w_cache = (w_q, w_scales, w_pad)
+            self._w_cache_data_ptr = w_data_ptr
+        else:
+            w_q, w_scales, w_pad = self._w_cache
 
         use_msd = getattr(self._msd_config, "use_msd_truncation", False) if self._msd_config else False
 
