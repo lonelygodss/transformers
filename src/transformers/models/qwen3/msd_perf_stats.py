@@ -501,7 +501,8 @@ class MSDPerfAccumulator:
     def _finalize_lite(self, online_delay: float) -> dict:
         """
         Produce compact lite-mode output: utilization, hw latency overhead,
-        zero-block ratio, mean p_eff, mac sparsity, and max latency per layer.
+        zero-block ratio, mean p_eff, zero-element percentage, and max latency
+        per layer.
         """
         per_layer = {}
 
@@ -539,6 +540,10 @@ class MSDPerfAccumulator:
         global_stats = {
             "num_layers": len(self._layers),
             "total_macs": g_total_elements,
+            # Explicit sparsity fields used by downstream lite analysis.
+            "zero_element_percentage": round(g_zero_elements / g_total_safe, 6),
+            "zero_block_percentage": round(g_zero_blocks / g_blocks_safe, 6),
+            # Backward-compatible aliases kept for existing readers.
             "mac_sparsity": round(g_zero_elements / g_total_safe, 6),
             "mean_effective_precision": round(g_p_eff_sum / g_total_safe, 4),
             "global_utilization": round(g_utilization, 6),
@@ -584,6 +589,9 @@ class MSDPerfAccumulator:
         return {
             "utilization": round(utilization, 6),
             "hw_latency_overhead": round(hw_overhead, 6),
+            "zero_element_percentage": round(mac_sparsity, 6),
+            "zero_block_percentage": round(zero_blk_ratio, 6),
+            # Backward-compatible aliases kept for existing readers.
             "zero_block_ratio": round(zero_blk_ratio, 6),
             "p_eff_mean": round(p_eff_mean, 4),
             "mac_sparsity": round(mac_sparsity, 6),
