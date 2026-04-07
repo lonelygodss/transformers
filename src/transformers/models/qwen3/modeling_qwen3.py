@@ -462,6 +462,53 @@ class _MXFPLinearBase(nn.Module):
         q, scales = self._quantize_to_blocks(blocks)
         return q, scales, pad_len
 
+    def _apply_activation_nm_sparsity(self, x_q: torch.Tensor) -> torch.Tensor:
+        """
+        Apply per-token activation-only n:m sparsity on quantized activation blocks.
+
+        The sparsity is computed dynamically at inference time by pruning the n
+        smallest-magnitude values in each m-sized group over the flattened
+        activation vector of each token row.
+        """
+        if self._msd_config is None or not getattr(self._msd_config, "use_activation_nm_sparsity", False):
+            return x_q
+
+        # Activation sparsity mode is intended for inference/evaluation only.
+        if self.training:
+            return x_q
+
+        n = int(getattr(self._msd_config, "activation_nm_n", 0))
+        m = int(getattr(self._msd_config, "activation_nm_m", 0))
+
+        if m <= 0:
+            raise ValueError(f"activation_nm_m must be > 0, got {m}")
+        if n < 0:
+            raise ValueError(f"activation_nm_n must be >= 0, got {n}")
+        if n == 0:
+            return x_q
+        if n >= m:
+            raise ValueError(f"activation n:m requires n < m, got n={n}, m={m}")
+
+        rows, num_blocks, block_size = x_q.shape
+        x_flat = x_q.reshape(rows, num_blocks * block_size)
+
+        pad_len = (-x_flat.shape[1]) % m
+        if pad_len:
+            x_flat = F.pad(x_flat, (0, pad_len), value=0.0)
+
+        groups = x_flat.view(rows, -1, m)
+        prune_indices = torch.topk(groups.abs(), k=n, dim=-1, largest=False).indices
+
+        mask = torch.ones_like(groups, dtype=torch.bool)
+        mask.scatter_(-1, prune_indices, False)
+        groups = groups.masked_fill(~mask, 0.0)
+
+        x_sparse = groups.view(rows, -1)
+        if pad_len:
+            x_sparse = x_sparse[:, :-pad_len]
+
+        return x_sparse.view(rows, num_blocks, block_size)
+
     def _get_channel_budgets_cached(self, compute_context, device):
         """Return channel_budgets for this layer on the given device, with caching."""
         cache = compute_context._channel_budgets_device_cache
@@ -668,6 +715,17 @@ class _MXFPLinearBase(nn.Module):
         x_2d = x.float().reshape(N, self.in_features)  # (N, in)
 
         x_q, x_scales, _ = self._prepare_blocks(x_2d, N)  # (N,   nb, bs), (N,   nb)
+        use_msd = getattr(self._msd_config, "use_msd_truncation", False) if self._msd_config else False
+        use_activation_nm = (
+            getattr(self._msd_config, "use_activation_nm_sparsity", False) if self._msd_config else False
+        )
+
+        if use_activation_nm and use_msd:
+            raise ValueError(
+                "use_activation_nm_sparsity cannot be combined with use_msd_truncation in this mode"
+            )
+
+        x_q = self._apply_activation_nm_sparsity(x_q)
 
         # Cache quantized weights: weights don't change during inference,
         # so avoid re-quantizing ~48k times (84 layers x 578 windows).
@@ -679,8 +737,6 @@ class _MXFPLinearBase(nn.Module):
             self._w_cache_data_ptr = w_data_ptr
         else:
             w_q, w_scales, w_pad = self._w_cache
-
-        use_msd = getattr(self._msd_config, "use_msd_truncation", False) if self._msd_config else False
 
         if use_msd:
             # MSD-first truncated dot-product path

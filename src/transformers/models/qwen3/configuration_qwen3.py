@@ -110,6 +110,13 @@ class Qwen3Config(PreTrainedConfig):
         msd_calibration_data (`dict`, *optional*):
             Per-layer, per-channel offline B_base values populated by calibration utility.
             Format: {"layer_name": [list of per-channel budgets]}.
+        use_activation_nm_sparsity (`bool`, *optional*, defaults to `False`):
+            Enable runtime activation-only n:m sparsity in MXFP MLP linear layers
+            during inference. This mode is intended for inference/evaluation only.
+        activation_nm_n (`int`, *optional*, defaults to 2):
+            Number of activation values to prune (set to zero) in each n:m group.
+        activation_nm_m (`int`, *optional*, defaults to 4):
+            Group size used by activation n:m pruning.
         msd_chunk_target_mib (`int`, *optional*, defaults to 512):
             Target size in MiB for the largest intermediate 4D tensor per output chunk
             during MSD truncated dot-product. Controls peak GPU memory: actual peak is
@@ -182,6 +189,9 @@ class Qwen3Config(PreTrainedConfig):
         mxfp6_format: str | None = "e2m3",   # "e2m3" (max=7.5) or "e3m2" (max=28.0)
         use_mxfp4: bool | None = False,
         mxfp4_block_size: int | None = 32,
+        use_activation_nm_sparsity: bool | None = False,
+        activation_nm_n: int | None = 2,
+        activation_nm_m: int | None = 4,
         # MSD-first time-domain truncated dot-product simulation
         use_msd_truncation: bool | None = False,
         msd_cycle_budget: int | None = 16,
@@ -240,6 +250,9 @@ class Qwen3Config(PreTrainedConfig):
         self.mxfp6_format = mxfp6_format
         self.use_mxfp4 = use_mxfp4
         self.mxfp4_block_size = mxfp4_block_size
+        self.use_activation_nm_sparsity = use_activation_nm_sparsity
+        self.activation_nm_n = activation_nm_n
+        self.activation_nm_m = activation_nm_m
         self.use_msd_truncation = use_msd_truncation
         self.msd_cycle_budget = msd_cycle_budget
         self.msd_online_delay = msd_online_delay
