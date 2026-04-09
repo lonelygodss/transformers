@@ -68,6 +68,24 @@ class MSDComputeContext:
 
     _active = None
 
+    @staticmethod
+    def _resolve_lite_p_eff_cap(config) -> float | None:
+        """Resolve lite p_eff contribution cap from active local element format."""
+        if not getattr(config, "msd_perf_stats_lite", False):
+            return None
+
+        if getattr(config, "use_mxfp8", False):
+            return 3.0
+
+        if getattr(config, "use_mxfp6", False):
+            fmt = (getattr(config, "mxfp6_format", "e2m3") or "e2m3").lower()
+            return 2.0 if fmt == "e3m2" else 3.0
+
+        if getattr(config, "use_mxfp4", False):
+            return 1.0
+
+        return None
+
     def __init__(self, channel_budgets, default_budget, config):
         self.channel_budgets = channel_budgets
         self.default_budget = default_budget
@@ -84,7 +102,12 @@ class MSDComputeContext:
         # Perf stats: can be disabled entirely or run in lite mode via config
         perf_enabled = getattr(config, "msd_perf_stats_enabled", True)
         perf_lite = getattr(config, "msd_perf_stats_lite", False)
-        self.perf_stats = MSDPerfAccumulator(lite=perf_lite) if perf_enabled else None
+        lite_p_eff_cap = self._resolve_lite_p_eff_cap(config)
+        self.perf_stats = (
+            MSDPerfAccumulator(lite=perf_lite, lite_p_eff_cap=lite_p_eff_cap)
+            if perf_enabled
+            else None
+        )
 
     @staticmethod
     def activate(ctx):
@@ -1573,6 +1596,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             getattr(cfg, "use_msd_truncation", False),
             getattr(cfg, "use_mxfp8", False),
             getattr(cfg, "use_mxfp6", False),
+            getattr(cfg, "mxfp6_format", "e2m3"),
             getattr(cfg, "use_mxfp4", False),
             getattr(cfg, "msd_cycle_budget", 16),
             getattr(cfg, "msd_online_delay", 2),

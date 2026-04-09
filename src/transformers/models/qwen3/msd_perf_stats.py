@@ -130,8 +130,9 @@ class MSDPerfAccumulator:
     Thread-safety: NOT thread-safe (same as MSDComputeContext — one per process).
     """
 
-    def __init__(self, lite: bool = False):
+    def __init__(self, lite: bool = False, lite_p_eff_cap: float | None = None):
         self.lite = lite
+        self.lite_p_eff_cap = float(lite_p_eff_cap) if lite_p_eff_cap is not None else None
         self._layers: dict[str, _LayerAccumulator] = {}
         self._bin_edges_cache: dict[torch.device, torch.Tensor] = {}
 
@@ -318,8 +319,15 @@ class MSDPerfAccumulator:
 
         p_flat = p_eff.reshape(N, c, nb * bs)  # (N, c, nb*bs)
 
+        p_flat_stats = (
+            torch.clamp(p_flat, max=self.lite_p_eff_cap)
+            if self.lite_p_eff_cap is not None
+            else p_flat
+        )
+        channel_p_sum = p_flat_stats.double().sum(dim=(0, 2))
+
         # p_eff sum for mean effective precision
-        acc.p_eff_sum[j0:j1] += p_flat.double().sum(dim=(0, 2))
+        acc.p_eff_sum[j0:j1] += channel_p_sum
 
         # Active / zero element counts
         active_mask = p_flat > 0  # (N, c, nb*bs) bool
@@ -333,7 +341,7 @@ class MSDPerfAccumulator:
 
         # Channel level: budget and effective cycles
         acc.total_budget_sum[j0:j1] += b_final_c.double().sum(dim=0)
-        acc.effective_cycles_sum[j0:j1] += p_flat.double().sum(dim=(0, 2))
+        acc.effective_cycles_sum[j0:j1] += channel_p_sum
 
         # Running max latency indicators
         if max_budget_chunk is not None:
