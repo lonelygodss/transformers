@@ -73,12 +73,20 @@ class _LayerAccumulator:
 
     When ``lite=True``, only the fields needed for lite metrics are allocated:
     utilization, zero-block ratio, sparsity, max latency, and mean p_eff.
+    Figure 5 cycle moments are optionally tracked when ``track_figure5_cycles=True``.
     """
 
-    def __init__(self, out_features: int, device: torch.device, lite: bool = False):
+    def __init__(
+        self,
+        out_features: int,
+        device: torch.device,
+        lite: bool = False,
+        track_figure5_cycles: bool = False,
+    ):
         self.out = out_features
         self.device = device
         self.lite = lite
+        self.track_figure5_cycles = track_figure5_cycles
 
         # ── Always-needed fields ──
 
@@ -103,6 +111,14 @@ class _LayerAccumulator:
         self.total_blocks = torch.zeros(out_features, dtype=torch.int64, device=device)
         self.in_features = 0
         self.num_samples = 0  # total N across all forward calls
+
+        if track_figure5_cycles:
+            self.channel_cycle_sum = torch.zeros(out_features, dtype=torch.float64, device=device)
+            self.channel_cycle_sq_sum = torch.zeros(out_features, dtype=torch.float64, device=device)
+            self.channel_cycle_count = torch.zeros(out_features, dtype=torch.int64, device=device)
+            self.layer_cycle_sum = torch.tensor(0.0, dtype=torch.float64, device=device)
+            self.layer_cycle_sq_sum = torch.tensor(0.0, dtype=torch.float64, device=device)
+            self.layer_cycle_count = torch.tensor(0, dtype=torch.int64, device=device)
 
         # ── Full-mode-only fields ──
         if not lite:
@@ -130,16 +146,27 @@ class MSDPerfAccumulator:
     Thread-safety: NOT thread-safe (same as MSDComputeContext — one per process).
     """
 
-    def __init__(self, lite: bool = False, lite_p_eff_cap: float | None = None):
+    def __init__(
+        self,
+        lite: bool = False,
+        lite_p_eff_cap: float | None = None,
+        figure5_layer_cycles: bool = False,
+    ):
         self.lite = lite
         self.lite_p_eff_cap = float(lite_p_eff_cap) if lite_p_eff_cap is not None else None
+        self.figure5_layer_cycles = bool(figure5_layer_cycles)
         self._layers: dict[str, _LayerAccumulator] = {}
         self._bin_edges_cache: dict[torch.device, torch.Tensor] = {}
 
     def _get_or_create_layer(self, layer_name: str, out_features: int, device: torch.device) -> _LayerAccumulator:
         """Get existing accumulator or create a new one for this layer."""
         if layer_name not in self._layers:
-            self._layers[layer_name] = _LayerAccumulator(out_features, device, lite=self.lite)
+            self._layers[layer_name] = _LayerAccumulator(
+                out_features,
+                device,
+                lite=self.lite,
+                track_figure5_cycles=self.figure5_layer_cycles,
+            )
         return self._layers[layer_name]
 
     def _get_bin_edges(self, device: torch.device) -> torch.Tensor:
@@ -164,6 +191,7 @@ class MSDPerfAccumulator:
         max_delay_chunk: torch.Tensor | None = None,
         max_budget_chunk: torch.Tensor | None = None,
         naf_width: torch.Tensor | None = None,
+        channel_cycle_chunk: torch.Tensor | None = None,
     ):
         """
         Record statistics for one output chunk from _forward_msd_truncated.
@@ -184,12 +212,16 @@ class MSDPerfAccumulator:
             naf_width: (N, c, nb, bs) NAF digit width of each product element (int32, optional).
                        When provided, enables correct full/partial block classification
                        (full = every element completed, not just active).
+            channel_cycle_chunk: (N, c) optional Figure 5 channel cycle estimates for
+                       this chunk, where each value is the block-serial cycle sum for
+                       one sample/channel pair.
         """
         if self.lite:
             return self._record_chunk_lite(
                 layer_name, p_eff, b_final_c, j0, j1, N, nb, bs,
                 max_delay_chunk=max_delay_chunk,
                 max_budget_chunk=max_budget_chunk,
+                channel_cycle_chunk=channel_cycle_chunk,
             )
 
         c = j1 - j0
@@ -198,7 +230,7 @@ class MSDPerfAccumulator:
         # Lazily determine full output size from the first chunk.
         acc = self._layers.get(layer_name)
         if acc is None:
-            acc = _LayerAccumulator(j1, device)
+            acc = _LayerAccumulator(j1, device, track_figure5_cycles=self.figure5_layer_cycles)
             self._layers[layer_name] = acc
         elif j1 > acc.out:
             acc = self._grow_accumulator(layer_name, j1, device)
@@ -270,6 +302,7 @@ class MSDPerfAccumulator:
         # ── Channel level ──
         acc.total_budget_sum[j0:j1] += b_final_c.double().sum(dim=0)
         acc.effective_cycles_sum[j0:j1] += p_flat_d.sum(dim=(0, 2))
+        self._record_channel_cycle_chunk(acc, j0, j1, channel_cycle_chunk, N)
 
         # ── Channel level: running max latency indicators ──
         if max_budget_chunk is not None:
@@ -299,6 +332,7 @@ class MSDPerfAccumulator:
         *,
         max_delay_chunk: torch.Tensor | None = None,
         max_budget_chunk: torch.Tensor | None = None,
+        channel_cycle_chunk: torch.Tensor | None = None,
     ):
         """
         Lite fast path for record_chunk — only collects metrics needed for
@@ -312,7 +346,12 @@ class MSDPerfAccumulator:
 
         acc = self._layers.get(layer_name)
         if acc is None:
-            acc = _LayerAccumulator(j1, device, lite=True)
+            acc = _LayerAccumulator(
+                j1,
+                device,
+                lite=True,
+                track_figure5_cycles=self.figure5_layer_cycles,
+            )
             self._layers[layer_name] = acc
         elif j1 > acc.out:
             acc = self._grow_accumulator(layer_name, j1, device)
@@ -342,6 +381,7 @@ class MSDPerfAccumulator:
         # Channel level: budget and effective cycles
         acc.total_budget_sum[j0:j1] += b_final_c.double().sum(dim=0)
         acc.effective_cycles_sum[j0:j1] += channel_p_sum
+        self._record_channel_cycle_chunk(acc, j0, j1, channel_cycle_chunk, N)
 
         # Running max latency indicators
         if max_budget_chunk is not None:
@@ -355,10 +395,74 @@ class MSDPerfAccumulator:
         acc.in_features = nb * bs
         acc.num_samples += N
 
+    def _record_channel_cycle_chunk(
+        self,
+        acc: _LayerAccumulator,
+        j0: int,
+        j1: int,
+        channel_cycle_chunk: torch.Tensor | None,
+        N: int,
+    ):
+        """Record per-channel cycle moments for Figure 5 metrics."""
+        if (
+            not self.figure5_layer_cycles
+            or channel_cycle_chunk is None
+            or not acc.track_figure5_cycles
+        ):
+            return
+
+        cycle_chunk = channel_cycle_chunk.double()
+        acc.channel_cycle_sum[j0:j1] += cycle_chunk.sum(dim=0)
+        acc.channel_cycle_sq_sum[j0:j1] += (cycle_chunk ** 2).sum(dim=0)
+        acc.channel_cycle_count[j0:j1] += int(N)
+
+    def record_layer_cycle(self, layer_name: str, layer_cycle_samples: torch.Tensor):
+        """Record per-sample layer cycle moments (layer cycle = max channel cycle)."""
+        if not self.figure5_layer_cycles:
+            return
+
+        acc = self._layers.get(layer_name)
+        if acc is None or not acc.track_figure5_cycles:
+            return
+
+        cycles = layer_cycle_samples.double().reshape(-1)
+        acc.layer_cycle_sum += cycles.sum()
+        acc.layer_cycle_sq_sum += (cycles ** 2).sum()
+        acc.layer_cycle_count += cycles.numel()
+
+    def _compute_figure5_cycle_metrics(self, acc: _LayerAccumulator) -> dict | None:
+        """Compute Figure 5 cycle metrics from accumulated moments."""
+        if not getattr(acc, "track_figure5_cycles", False):
+            return None
+        if int(acc.layer_cycle_count.item()) <= 0:
+            return None
+
+        ch_count = acc.channel_cycle_count.clamp(min=1).double()
+        ch_mean = acc.channel_cycle_sum / ch_count
+        ch_var = (acc.channel_cycle_sq_sum / ch_count - ch_mean ** 2).clamp(min=0.0)
+        ch_std = ch_var.sqrt()
+
+        layer_count = acc.layer_cycle_count.clamp(min=1).double()
+        layer_mean = acc.layer_cycle_sum / layer_count
+        layer_var = (acc.layer_cycle_sq_sum / layer_count - layer_mean ** 2).clamp(min=0.0)
+        layer_std = layer_var.sqrt()
+
+        return {
+            "avg_layer_cycle": round(float(layer_mean.item()), 4),
+            "avg_mean_channel_cycle": round(float(ch_mean.mean().item()), 4),
+            "layer_cycle_std": round(float(layer_std.item()), 4),
+            "avg_std_channel_cycle": round(float(ch_std.mean().item()), 4),
+        }
+
     def _grow_accumulator(self, layer_name: str, new_out: int, device: torch.device) -> _LayerAccumulator:
         """Grow an existing accumulator to accommodate more output channels."""
         old = self._layers[layer_name]
-        new_acc = _LayerAccumulator(new_out, device, lite=old.lite)
+        new_acc = _LayerAccumulator(
+            new_out,
+            device,
+            lite=old.lite,
+            track_figure5_cycles=old.track_figure5_cycles,
+        )
         o = old.out
         # Copy always-present fields
         new_acc.p_eff_sum[:o] = old.p_eff_sum
@@ -373,6 +477,13 @@ class MSDPerfAccumulator:
         new_acc.total_blocks[:o] = old.total_blocks
         new_acc.in_features = old.in_features
         new_acc.num_samples = old.num_samples
+        if old.track_figure5_cycles:
+            new_acc.channel_cycle_sum[:o] = old.channel_cycle_sum
+            new_acc.channel_cycle_sq_sum[:o] = old.channel_cycle_sq_sum
+            new_acc.channel_cycle_count[:o] = old.channel_cycle_count
+            new_acc.layer_cycle_sum.copy_(old.layer_cycle_sum)
+            new_acc.layer_cycle_sq_sum.copy_(old.layer_cycle_sq_sum)
+            new_acc.layer_cycle_count.copy_(old.layer_cycle_count)
         # Copy full-mode-only fields
         if not old.lite:
             new_acc.p_eff_sq_sum[:o] = old.p_eff_sq_sum
@@ -594,7 +705,7 @@ class MSDPerfAccumulator:
         # Average max latency (mean of per-channel max budgets)
         avg_max_latency = float(acc.max_budget.mean())
 
-        return {
+        out = {
             "utilization": round(utilization, 6),
             "hw_latency_overhead": round(hw_overhead, 6),
             "zero_element_percentage": round(mac_sparsity, 6),
@@ -605,6 +716,12 @@ class MSDPerfAccumulator:
             "mac_sparsity": round(mac_sparsity, 6),
             "avg_max_latency": round(avg_max_latency, 2),
         }
+
+        figure5_metrics = self._compute_figure5_cycle_metrics(acc)
+        if figure5_metrics is not None:
+            out.update(figure5_metrics)
+
+        return out
 
     def _finalize_layer(self, acc: _LayerAccumulator, want_detail: bool) -> dict:
         """
@@ -695,6 +812,10 @@ class MSDPerfAccumulator:
                 ), 6),
             },
         }
+
+        figure5_metrics = self._compute_figure5_cycle_metrics(acc)
+        if figure5_metrics is not None:
+            summary["channel_level"].update(figure5_metrics)
 
         layer_entry = {"summary": summary}
 

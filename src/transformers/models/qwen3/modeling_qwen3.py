@@ -103,8 +103,13 @@ class MSDComputeContext:
         perf_enabled = getattr(config, "msd_perf_stats_enabled", True)
         perf_lite = getattr(config, "msd_perf_stats_lite", False)
         lite_p_eff_cap = self._resolve_lite_p_eff_cap(config)
+        figure5_layer_cycles = getattr(config, "msd_figure5_layer_cycles", False)
         self.perf_stats = (
-            MSDPerfAccumulator(lite=perf_lite, lite_p_eff_cap=lite_p_eff_cap)
+            MSDPerfAccumulator(
+                lite=perf_lite,
+                lite_p_eff_cap=lite_p_eff_cap,
+                figure5_layer_cycles=figure5_layer_cycles,
+            )
             if perf_enabled
             else None
         )
@@ -658,6 +663,9 @@ class _MXFPLinearBase(nn.Module):
         x_q_exp = x_q.unsqueeze(1)              # (N, 1, nb, bs)
         intra_exp = intra_delays.unsqueeze(1)    # (N, 1, nb, bs)
         x_scales_exp = x_scales.unsqueeze(1)     # (N, 1, nb)
+        _perf = compute_context.perf_stats if compute_context is not None else None
+        track_figure5_cycles = bool(_perf is not None and getattr(_perf, "figure5_layer_cycles", False))
+        layer_cycle_max = None
 
         for j0 in range(0, out, chunk_size):
             j1 = min(j0 + chunk_size, out)
@@ -677,6 +685,25 @@ class _MXFPLinearBase(nn.Module):
             # 2. Element-wise products: (N, c, nb, bs)
             prods = x_q_exp * w_q_c.unsqueeze(0)  # (N, c, nb, bs)
 
+            channel_cycle_chunk = None
+            if track_figure5_cycles:
+                # Figure 5 cycle model: block delay = inter + min(intra),
+                # and block cycle = max(B - block_delay, 0) for non-zero blocks.
+                intra_min = intra_exp.amin(dim=-1)  # (N, 1, nb)
+                block_delay = inter_delays_c + intra_min  # (N, c, nb)
+                block_nonzero = prods.ne(0).any(dim=-1)  # (N, c, nb)
+
+                block_cycles = torch.clamp(b_final_c.unsqueeze(-1) - block_delay, min=0.0)
+                block_cycles = block_cycles * block_nonzero.to(block_cycles.dtype)
+                channel_cycle_chunk = block_cycles.sum(dim=-1)  # (N, c)
+
+                chunk_layer_cycle = channel_cycle_chunk.max(dim=1).values  # (N,)
+                if layer_cycle_max is None:
+                    layer_cycle_max = chunk_layer_cycle
+                else:
+                    torch.maximum(layer_cycle_max, chunk_layer_cycle, out=layer_cycle_max)
+                del intra_min, block_delay, block_nonzero, block_cycles, chunk_layer_cycle
+
             # 3. Total delay: (N, c, nb, bs)
             total_delay = inter_delays_c.unsqueeze(-1) + intra_exp + online_delay
 
@@ -687,7 +714,6 @@ class _MXFPLinearBase(nn.Module):
             p_eff = torch.clamp(p_eff, min=0.0)
 
             # 4a. Record performance statistics (compute metrics only when needed)
-            _perf = compute_context.perf_stats if compute_context is not None else None
             if _perf is not None:
                 max_delay_chunk = total_delay.amax(dim=(0, 2, 3))  # (c,) max over N, nb, bs
                 max_budget_chunk = b_final_c.amax(dim=0)            # (c,) max over N
@@ -697,8 +723,10 @@ class _MXFPLinearBase(nn.Module):
                     max_delay_chunk=max_delay_chunk,
                     max_budget_chunk=max_budget_chunk,
                     naf_width=naf_width,
+                    channel_cycle_chunk=channel_cycle_chunk,
                 )
                 del naf_width
+            del channel_cycle_chunk
             del total_delay  # free 4D tensor early
 
             # 5. Truncate products (BSD/NAF truncation)
@@ -718,6 +746,10 @@ class _MXFPLinearBase(nn.Module):
             combined_scales = x_scales_exp * w_scales_c.unsqueeze(0)  # (N, c, nb)
             result[:, j0:j1] = (block_dots * combined_scales).sum(dim=-1)
             del block_dots, combined_scales, inter_delays_c
+
+        if track_figure5_cycles and layer_cycle_max is not None:
+            _perf.record_layer_cycle(self.layer_name, layer_cycle_max)
+            del layer_cycle_max
 
         return result
 
@@ -1608,6 +1640,7 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             id(getattr(cfg, "msd_calibration_data", None)),
             getattr(cfg, "msd_perf_stats_enabled", True),
             getattr(cfg, "msd_perf_stats_lite", False),
+            getattr(cfg, "msd_figure5_layer_cycles", False),
         )
         if self._msd_context is None or self._msd_context_config_hash != cfg_hash:
             self._msd_context = MSDComputeContext.create_from_config(cfg, self.model)
