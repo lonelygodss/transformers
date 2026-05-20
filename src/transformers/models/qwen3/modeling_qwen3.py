@@ -442,6 +442,7 @@ class _MXFPLinearBase(nn.Module):
         # Weight quantization cache (avoids re-quantizing every forward pass)
         self._w_cache = None
         self._w_cache_data_ptr = None
+        self._w_cache_key = None
 
     def _get_block_size(self, config) -> int:
         """Resolved by subclasses; fall back to 32."""
@@ -489,6 +490,52 @@ class _MXFPLinearBase(nn.Module):
         blocks = tensor.view(rows, num_blocks, self.block_size)
         q, scales = self._quantize_to_blocks(blocks)
         return q, scales, pad_len
+
+    def _weight_cache_dtype(self) -> str:
+        cfg = self._msd_config
+        dtype = getattr(cfg, "mxfp_weight_cache_dtype", "float16") if cfg is not None else "float16"
+        if dtype not in {"float32", "float16", "none"}:
+            raise ValueError(
+                "mxfp_weight_cache_dtype must be one of 'float32', 'float16', or 'none', "
+                f"got {dtype!r}"
+            )
+        return dtype
+
+    def _weight_cache_key(self, cache_dtype: str) -> tuple:
+        weight = self.weight
+        fmt = getattr(self, "fp6_format", None)
+        return (
+            weight.data_ptr(),
+            getattr(weight, "_version", None),
+            weight.device,
+            weight.dtype,
+            self.block_size,
+            type(self).__name__,
+            fmt,
+            cache_dtype,
+        )
+
+    def _get_quantized_weight_cache(self) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Return quantized weights, optionally using a compact persistent cache."""
+        cache_dtype = self._weight_cache_dtype()
+        key = self._weight_cache_key(cache_dtype)
+
+        if cache_dtype == "none":
+            self._w_cache = None
+            self._w_cache_key = None
+            self._w_cache_data_ptr = None
+            w_q, w_scales, w_pad = self._prepare_blocks(self.weight.float(), self.out_features)
+            return w_q, w_scales, w_pad
+
+        if self._w_cache is None or self._w_cache_key != key:
+            w_q, w_scales, w_pad = self._prepare_blocks(self.weight.float(), self.out_features)
+            if cache_dtype == "float16":
+                w_q = w_q.to(torch.float16)
+            self._w_cache = (w_q, w_scales, w_pad)
+            self._w_cache_key = key
+            self._w_cache_data_ptr = self.weight.data_ptr()
+
+        return self._w_cache
 
     def _apply_activation_nm_sparsity(self, x_q: torch.Tensor) -> torch.Tensor:
         """
@@ -615,6 +662,40 @@ class _MXFPLinearBase(nn.Module):
     # Configurable at runtime via config.msd_chunk_target_mib.
     _MSD_CHUNK_TARGET_BYTES: int = 512 * 1024 ** 2  # 512 MiB fallback
 
+    def _forward_mx_exact_chunked(self, x_q, x_scales, w_q, w_scales, N):
+        """
+        Exact MX block-wise matmul with output-channel chunking.
+
+        This preserves the old reduction order across input blocks for each
+        output channel while avoiding a full (num_blocks, N, out) temporary.
+        """
+        cfg = self._msd_config
+        nb = x_q.shape[1]
+        out = w_q.shape[0]
+        target_mib = getattr(cfg, "mxfp_chunk_target_mib", 256) if cfg is not None else 256
+        target_bytes = int(target_mib) * 1024 ** 2
+        chunk_size = max(1, target_bytes // (4 * N * nb))
+        chunk_size = min(chunk_size, out)
+
+        result = torch.empty((N, out), dtype=torch.float32, device=x_q.device)
+        x_bmm = x_q.permute(1, 0, 2).contiguous()  # (nb, N, bs)
+        x_scales_t = x_scales.t().unsqueeze(-1)    # (nb, N, 1)
+
+        for j0 in range(0, out, chunk_size):
+            j1 = min(j0 + chunk_size, out)
+            w_q_c = w_q[j0:j1]
+            if w_q_c.dtype != torch.float32:
+                w_q_c = w_q_c.float()
+            dots = torch.bmm(
+                x_bmm,
+                w_q_c.permute(1, 2, 0).contiguous(),
+            )  # (nb, N, c)
+            scales = x_scales_t * w_scales[j0:j1].t().unsqueeze(1)  # (nb, N, c)
+            result[:, j0:j1] = (dots * scales).sum(dim=0)
+            del dots, scales, w_q_c
+
+        return result
+
     def _forward_msd_truncated(self, x_q, x_scales, w_q, w_scales, N, compute_context):
         """
         MSD-first truncated dot-product simulation (output-chunked).
@@ -673,6 +754,8 @@ class _MXFPLinearBase(nn.Module):
 
             # Slice weight-side tensors along output dim
             w_q_c = w_q[j0:j1]           # (c, nb, bs)
+            if w_q_c.dtype != torch.float32:
+                w_q_c = w_q_c.float()
             w_scales_c = w_scales[j0:j1]  # (c, nb)
             b_final_c = b_final[:, j0:j1]  # (N, c)
 
@@ -784,28 +867,31 @@ class _MXFPLinearBase(nn.Module):
 
         # Cache quantized weights: weights don't change during inference,
         # so avoid re-quantizing ~48k times (84 layers x 578 windows).
-        w_data_ptr = self.weight.data.data_ptr()
-        if self._w_cache is None or self._w_cache_data_ptr != w_data_ptr:
-            w_2d = self.weight.float()  # (out, in)
-            w_q, w_scales, w_pad = self._prepare_blocks(w_2d, self.out_features)
-            self._w_cache = (w_q, w_scales, w_pad)
-            self._w_cache_data_ptr = w_data_ptr
-        else:
-            w_q, w_scales, w_pad = self._w_cache
+        w_q, w_scales, w_pad = self._get_quantized_weight_cache()
 
         if use_msd:
             # MSD-first truncated dot-product path
             result = self._forward_msd_truncated(x_q, x_scales, w_q, w_scales, N, compute_context)
         else:
             # Standard exact MX block-wise matmul path
-            elem_dots = torch.bmm(
-                x_q.permute(1, 0, 2),  # (nb, N,  bs)
-                w_q.permute(1, 2, 0),  # (nb, bs, out)
-            )  # (nb, N, out)
+            use_chunked = (
+                getattr(self._msd_config, "mxfp_use_chunked_exact", True)
+                if self._msd_config is not None
+                else True
+            )
+            if use_chunked:
+                result = self._forward_mx_exact_chunked(x_q, x_scales, w_q, w_scales, N)
+            else:
+                if w_q.dtype != torch.float32:
+                    w_q = w_q.float()
+                elem_dots = torch.bmm(
+                    x_q.permute(1, 0, 2),  # (nb, N,  bs)
+                    w_q.permute(1, 2, 0),  # (nb, bs, out)
+                )  # (nb, N, out)
 
-            combined_scales = x_scales.t().unsqueeze(-1) * w_scales.t().unsqueeze(1)
+                combined_scales = x_scales.t().unsqueeze(-1) * w_scales.t().unsqueeze(1)
 
-            result = (elem_dots * combined_scales).sum(dim=0)  # (N, out)
+                result = (elem_dots * combined_scales).sum(dim=0)  # (N, out)
 
         if self.bias_param is not None:
             result = result + self.bias_param

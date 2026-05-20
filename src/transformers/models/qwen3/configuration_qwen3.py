@@ -89,6 +89,17 @@ class Qwen3Config(PreTrainedConfig):
             Beginning of stream token id.
         eos_token_id (`int`, *optional*):
             End of stream token id.
+        mxfp_use_chunked_exact (`bool`, *optional*, defaults to `True`):
+            Use output-channel chunking for exact MX-only matmul. This preserves
+            MX math while avoiding full `(num_blocks, tokens, out_features)`
+            temporaries.
+        mxfp_chunk_target_mib (`int`, *optional*, defaults to 256):
+            Target size in MiB for the largest exact-MX output-chunk temporary.
+        mxfp_weight_cache_dtype (`str`, *optional*, defaults to `"float16"`):
+            Persistent quantized-weight cache storage for MXFP layers:
+            `"float16"` stores compact quantized values and computes in fp32,
+            `"float32"` keeps the historical cache, and `"none"` recomputes
+            weight quantization each forward.
         use_msd_truncation (`bool`, *optional*, defaults to `False`):
             Enable MSD-first time-domain truncated dot-product simulation. Only effective
             when one of the MXFP formats (use_mxfp8/6/4) is also active.
@@ -110,6 +121,12 @@ class Qwen3Config(PreTrainedConfig):
         msd_calibration_data (`dict`, *optional*):
             Per-layer, per-channel offline B_base values populated by calibration utility.
             Format: {"layer_name": [list of per-channel budgets]}.
+        msd_perf_stats_enabled (`bool`, *optional*, defaults to `True`):
+            Enable MSD performance-statistics accumulation during MXFP/MSD inference.
+        msd_perf_stats_lite (`bool`, *optional*, defaults to `False`):
+            Use the lightweight MSD statistics path while preserving numerical outputs.
+        msd_figure5_layer_cycles (`bool`, *optional*, defaults to `False`):
+            Record per-layer cycle details for Figure 5 diagnostics.
         use_activation_nm_sparsity (`bool`, *optional*, defaults to `False`):
             Enable runtime activation-only n:m sparsity in MXFP MLP linear layers
             during inference. This mode is intended for inference/evaluation only.
@@ -189,6 +206,9 @@ class Qwen3Config(PreTrainedConfig):
         mxfp6_format: str | None = "e2m3",   # "e2m3" (max=7.5) or "e3m2" (max=28.0)
         use_mxfp4: bool | None = False,
         mxfp4_block_size: int | None = 32,
+        mxfp_use_chunked_exact: bool | None = True,
+        mxfp_chunk_target_mib: int | None = 256,
+        mxfp_weight_cache_dtype: str | None = "float16",
         use_activation_nm_sparsity: bool | None = False,
         activation_nm_n: int | None = 2,
         activation_nm_m: int | None = 4,
@@ -203,6 +223,9 @@ class Qwen3Config(PreTrainedConfig):
         msd_pipeline_precision_loss: int | None = 2,
         msd_calibration_data: dict | None = None,
         msd_chunk_target_mib: int | None = 512,
+        msd_perf_stats_enabled: bool | None = True,
+        msd_perf_stats_lite: bool | None = False,
+        msd_figure5_layer_cycles: bool | None = False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -250,6 +273,9 @@ class Qwen3Config(PreTrainedConfig):
         self.mxfp6_format = mxfp6_format
         self.use_mxfp4 = use_mxfp4
         self.mxfp4_block_size = mxfp4_block_size
+        self.mxfp_use_chunked_exact = mxfp_use_chunked_exact
+        self.mxfp_chunk_target_mib = mxfp_chunk_target_mib
+        self.mxfp_weight_cache_dtype = mxfp_weight_cache_dtype
         self.use_activation_nm_sparsity = use_activation_nm_sparsity
         self.activation_nm_n = activation_nm_n
         self.activation_nm_m = activation_nm_m
@@ -263,6 +289,9 @@ class Qwen3Config(PreTrainedConfig):
         self.msd_pipeline_precision_loss = msd_pipeline_precision_loss
         self.msd_calibration_data = msd_calibration_data
         self.msd_chunk_target_mib = msd_chunk_target_mib
+        self.msd_perf_stats_enabled = msd_perf_stats_enabled
+        self.msd_perf_stats_lite = msd_perf_stats_lite
+        self.msd_figure5_layer_cycles = msd_figure5_layer_cycles
 
         super().__init__(**kwargs)
 
