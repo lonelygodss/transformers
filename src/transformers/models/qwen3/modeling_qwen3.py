@@ -662,6 +662,11 @@ class _MXFPLinearBase(nn.Module):
     # Configurable at runtime via config.msd_chunk_target_mib.
     _MSD_CHUNK_TARGET_BYTES: int = 512 * 1024 ** 2  # 512 MiB fallback
 
+    def _report_mxfp_progress(self, phase: str, **payload):
+        hook = getattr(self._msd_config, "_mxfp_progress_hook", None) if self._msd_config is not None else None
+        if callable(hook):
+            hook(module=self, phase=phase, **payload)
+
     def _forward_mx_exact_chunked(self, x_q, x_scales, w_q, w_scales, N):
         """
         Exact MX block-wise matmul with output-channel chunking.
@@ -681,8 +686,19 @@ class _MXFPLinearBase(nn.Module):
         x_bmm = x_q.permute(1, 0, 2).contiguous()  # (nb, N, bs)
         x_scales_t = x_scales.t().unsqueeze(-1)    # (nb, N, 1)
 
-        for j0 in range(0, out, chunk_size):
+        total_chunks = (out + chunk_size - 1) // chunk_size
+        for chunk_idx, j0 in enumerate(range(0, out, chunk_size), start=1):
             j1 = min(j0 + chunk_size, out)
+            self._report_mxfp_progress(
+                "mx_exact_chunk",
+                chunk_idx=chunk_idx,
+                total_chunks=total_chunks,
+                j0=j0,
+                j1=j1,
+                out_features=out,
+                chunk_size=chunk_size,
+                N=N,
+            )
             w_q_c = w_q[j0:j1]
             if w_q_c.dtype != torch.float32:
                 w_q_c = w_q_c.float()
@@ -748,9 +764,20 @@ class _MXFPLinearBase(nn.Module):
         track_figure5_cycles = bool(_perf is not None and getattr(_perf, "figure5_layer_cycles", False))
         layer_cycle_max = None
 
-        for j0 in range(0, out, chunk_size):
+        total_chunks = (out + chunk_size - 1) // chunk_size
+        for chunk_idx, j0 in enumerate(range(0, out, chunk_size), start=1):
             j1 = min(j0 + chunk_size, out)
             c = j1 - j0  # current chunk width
+            self._report_mxfp_progress(
+                "msd_chunk",
+                chunk_idx=chunk_idx,
+                total_chunks=total_chunks,
+                j0=j0,
+                j1=j1,
+                out_features=out,
+                chunk_size=chunk_size,
+                N=N,
+            )
 
             # Slice weight-side tensors along output dim
             w_q_c = w_q[j0:j1]           # (c, nb, bs)
@@ -1666,6 +1693,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
+        shift_labels = kwargs.pop("shift_labels", None)
+        loss_token_chunk_size = kwargs.pop("loss_token_chunk_size", None)
+        output_logits = kwargs.pop("output_logits", True)
         # Activate cached MSD compute context if MSD truncation is active
         use_msd = getattr(self.config, "use_msd_truncation", False)
         has_mxfp = (
@@ -1690,11 +1720,42 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             hidden_states = outputs.last_hidden_state
             # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
             slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            logits = self.lm_head(hidden_states[:, slice_indices, :])
-
             loss = None
-            if labels is not None:
-                loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            can_chunk_loss = (
+                labels is not None
+                and shift_labels is not None
+                and loss_token_chunk_size is not None
+                and not output_logits
+                and torch.is_tensor(slice_indices)
+            )
+            if can_chunk_loss:
+                chunk_size = max(1, int(loss_token_chunk_size))
+                total_items = (shift_labels != -100).sum()
+                loss_sum = hidden_states.new_zeros((), dtype=torch.float32)
+                for pos in range(0, int(slice_indices.numel()), chunk_size):
+                    chunk_indices = slice_indices[pos : pos + chunk_size]
+                    chunk_labels = shift_labels[..., pos : pos + chunk_indices.numel()].reshape(-1)
+                    chunk_logits = self.lm_head(hidden_states[:, chunk_indices, :]).float()
+                    loss_sum = loss_sum + F.cross_entropy(
+                        chunk_logits.reshape(-1, self.config.vocab_size),
+                        chunk_labels.to(chunk_logits.device),
+                        ignore_index=-100,
+                        reduction="sum",
+                    )
+                    del chunk_logits, chunk_labels
+                loss = loss_sum / total_items.to(loss_sum.device)
+                logits = hidden_states.new_empty((hidden_states.shape[0], 0, self.config.vocab_size))
+            else:
+                logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+            if labels is not None and loss is None:
+                loss = self.loss_function(
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.vocab_size,
+                    shift_labels=shift_labels,
+                    **kwargs,
+                )
 
             return CausalLMOutputWithPast(
                 loss=loss,
