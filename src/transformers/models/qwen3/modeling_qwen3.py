@@ -351,15 +351,14 @@ def _msd_truncate(value, num_digits):
         abs_v = value.abs()
         sign = value.sign()
 
-        # Compute the zero-output mask early; abs_v still needed for scaling below.
-        mask = (num_digits > 0) & (abs_v > 0)
-
         # Scale to integer mantissa: shift so that MSB sits near bit-22/23.
-        # We use 2^(23 - msb_pos) so the integer has its MSB at bit 23.
-        msb_pos = torch.floor(torch.log2(abs_v.clamp(min=1e-45)))  # float position of MSB
-        scale_up = torch.pow(2.0, 23.0 - msb_pos)  # shift to [2^23, 2^24)
-        del msb_pos
-        x_scaled = torch.round(abs_v * scale_up).to(torch.int32)  # int mantissa
+        # frexp gives abs_v = mantissa * 2**exp with mantissa in [0.5, 1),
+        # so round(mantissa * 2**24) is equivalent to the previous
+        # round(abs_v * 2**(23 - floor(log2(abs_v)))) without materializing
+        # log2/pow scale tensors.
+        mantissa, exponent = torch.frexp(abs_v)
+        x_scaled = torch.round(mantissa * (1 << 24)).to(torch.int32)  # int mantissa
+        del mantissa
         del abs_v
 
         # ── Inline _to_naf_components with early frees ──────────────────────
@@ -386,7 +385,8 @@ def _msd_truncate(value, num_digits):
         # ────────────────────────────────────────────────────────────────────
 
         # Number of digit positions to ZERO-out from the bottom
-        num_digits_i = num_digits.to(torch.int32) if num_digits.is_floating_point() else num_digits
+        num_digits_i = num_digits.to(torch.int32) if num_digits.is_floating_point() else num_digits.to(torch.int32)
+        num_digits_i = num_digits_i.clamp(min=0)
         drop = (naf_width - num_digits_i).clamp(min=0)  # int32
         del naf_width, num_digits_i
 
@@ -400,14 +400,17 @@ def _msd_truncate(value, num_digits):
         naf_neg_trunc = naf_neg & keep_mask
         del naf_pos, naf_neg, keep_mask
 
-        # Reconstruct float value:  result = sign * (pos - neg) / scale_up
-        reconstructed = (naf_pos_trunc.float() - naf_neg_trunc.float()) / scale_up
-        del naf_pos_trunc, naf_neg_trunc, scale_up
+        # Reconstruct float value.  The old scale_down was
+        # 2**(floor(log2(abs_v)) - 23), and floor(log2(abs_v)) == exponent - 1.
+        reconstructed = torch.ldexp(
+            naf_pos_trunc.float() - naf_neg_trunc.float(),
+            exponent - 24,
+        )
+        del naf_pos_trunc, naf_neg_trunc, exponent
         result = sign * reconstructed
         del sign, reconstructed
 
-        # Zero out elements with num_digits <= 0 or value == 0
-        return torch.where(mask, result, torch.zeros_like(result))
+        return result
 
 
 # ── Shared base class ────────────────────────────────────────────────────────
