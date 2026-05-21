@@ -269,14 +269,8 @@ def _naf_digit_width(naf_pos, naf_neg):
         width: int32 tensor
     """
     combined = naf_pos | naf_neg
-    # bit_length via float log2 (works up to 2^23 with float32)
-    comb_f = combined.float()
-    # floor(log2(x)) + 1  gives bit-length;  0 maps to 0
-    width = torch.where(
-        combined > 0,
-        torch.floor(torch.log2(comb_f)).int() + 1,
-        torch.zeros_like(combined),
-    )
+    # bit_length via frexp exponent; 0 maps to exponent 0.
+    _, width = torch.frexp(combined.float())
     return width
 
 
@@ -310,16 +304,12 @@ def _compute_naf_widths(value):
         naf_neg = x_h & (~s)
         del x_h, s
 
-        # Width = 1 + floor(log2(combined)) for non-zero, else 0
+        # Width = frexp exponent, equivalent to 1 + floor(log2(combined));
+        # zero maps to exponent 0.
         combined = naf_pos | naf_neg
         del naf_pos, naf_neg
-        comb_f = combined.float()
-        width = torch.where(
-            combined > 0,
-            torch.floor(torch.log2(comb_f)).int() + 1,
-            torch.zeros_like(combined),
-        )
-        del combined, comb_f
+        _, width = torch.frexp(combined.float())
+        del combined
         return width
 
 
@@ -375,13 +365,8 @@ def _msd_truncate(value, num_digits):
 
         # ── Inline _naf_digit_width with early frees ─────────────────────
         combined = naf_pos | naf_neg
-        comb_f = combined.float()
-        naf_width = torch.where(
-            combined > 0,
-            torch.floor(torch.log2(comb_f)).int() + 1,
-            torch.zeros_like(combined),
-        )
-        del combined, comb_f
+        _, naf_width = torch.frexp(combined.float())
+        del combined
         # ────────────────────────────────────────────────────────────────────
 
         # Number of digit positions to ZERO-out from the bottom
