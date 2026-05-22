@@ -54,8 +54,43 @@ logger = logging.get_logger(__name__)
 # in modeling_qwen3.py.  With float32 elements of size 4, a chunk of `c`
 # output channels produces tensors of shape (N, c, nb, bs) = c * N * nb * bs * 4.
 _CAL_CHUNK_TARGET_BYTES: int = 256 * 1024**2  # 256 MiB — keeps _msd_truncate peak within ~1 GiB
+_CAL_COMPILE_MSD_TRUNCATE: bool = False
+_COMPILED_CAL_MSD_TRUNCATE = None
 _BUDGET_MIN: int = 4
 _BUDGET_MAX: int = 48
+
+
+def configure_calibration_runtime(
+    *,
+    chunk_target_mib: int | None = None,
+    compile_msd_truncate: bool | None = None,
+) -> None:
+    """Configure calibration-only scheduling flags without changing MSD math."""
+    global _CAL_CHUNK_TARGET_BYTES, _CAL_COMPILE_MSD_TRUNCATE
+    if chunk_target_mib is not None:
+        if int(chunk_target_mib) <= 0:
+            raise ValueError(f"chunk_target_mib must be positive, got {chunk_target_mib!r}")
+        _CAL_CHUNK_TARGET_BYTES = int(chunk_target_mib) * 1024**2
+    if compile_msd_truncate is not None:
+        _CAL_COMPILE_MSD_TRUNCATE = bool(compile_msd_truncate)
+
+
+def _get_cal_msd_truncate(device: torch.device):
+    from .modeling_qwen3 import _msd_truncate
+
+    global _COMPILED_CAL_MSD_TRUNCATE
+    if _CAL_COMPILE_MSD_TRUNCATE and device.type == "cuda":
+        if _COMPILED_CAL_MSD_TRUNCATE is None:
+            _COMPILED_CAL_MSD_TRUNCATE = torch.compile(
+                _msd_truncate, fullgraph=True, mode="reduce-overhead"
+            )
+        return _COMPILED_CAL_MSD_TRUNCATE
+    return _msd_truncate
+
+
+def _mark_cal_compile_step(device: torch.device) -> None:
+    if _CAL_COMPILE_MSD_TRUNCATE and device.type == "cuda" and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+        torch.compiler.cudagraph_mark_step_begin()
 
 
 def _safe_log2_cal(x):
@@ -74,11 +109,13 @@ def _compute_intra_delays(x_q):
         intra_delays: (N, nb, bs) — per-element delay within each block
     """
     abs_vals = x_q.abs()
+    _, exponent = torch.frexp(abs_vals)
     elem_log2 = torch.where(
         abs_vals > 0,
-        torch.floor(torch.log2(abs_vals)),
+        (exponent - 1).to(x_q.dtype),
         torch.tensor(-60.0, dtype=x_q.dtype, device=x_q.device),
     )
+    del exponent
     e_max_block = elem_log2.amax(dim=-1, keepdim=True)
     return e_max_block - elem_log2  # (N, nb, bs)
 
@@ -161,6 +198,7 @@ def collect_layer_block_cache(
     online_delay: Optional[int] = None,
     show_progress: bool = False,
     progress_prefix: str = "",
+    projection_filter: set[str] | None = None,
 ) -> dict:
     """
     Stage 1: Capture block-level data from forward passes.
@@ -184,6 +222,8 @@ def collect_layer_block_cache(
     mxfp_layers = {}
     for name, module in model.named_modules():
         if isinstance(module, _MXFPLinearBase):
+            if projection_filter and not any(proj in name for proj in projection_filter):
+                continue
             mxfp_layers[name] = module
 
     if not mxfp_layers:
@@ -304,11 +344,10 @@ def _compute_truncated_result(
     Returns:
         (result, channel_errors) where channel_errors is (out,) or None
     """
-    from .modeling_qwen3 import _msd_truncate
-
     out = cache.out_features
     N = cache.x_q.shape[0]
     device = cache.device
+    truncate_fn = _get_cal_msd_truncate(device)
 
     result = torch.zeros(N, out, dtype=torch.float32, device=device)
     for j0 in range(0, out, cache.chunk_size):
@@ -328,7 +367,8 @@ def _compute_truncated_result(
         p_eff = torch.clamp(b_exp - total_delay, min=0.0)
         del total_delay
 
-        prods_trunc = _msd_truncate(prods, p_eff)
+        _mark_cal_compile_step(device)
+        prods_trunc = truncate_fn(prods, p_eff)
         del prods, p_eff
         block_dots = prods_trunc.sum(dim=-1)
         del prods_trunc
@@ -651,9 +691,8 @@ def _find_budget_for_snr(
         - channel_detail: dict of per-channel lists (only populated when
           collect_channel_detail=True, else empty dict)
     """
-    from .modeling_qwen3 import _msd_truncate
-
     device = x_q.device
+    truncate_fn = _get_cal_msd_truncate(device)
     N = x_q.shape[0]
     out = w_q.shape[0]
     nb = x_q.shape[1]
@@ -719,7 +758,8 @@ def _find_budget_for_snr(
             del total_delay
 
             # 4. Truncate & accumulate
-            prods_trunc = _msd_truncate(prods, p_eff)
+            _mark_cal_compile_step(device)
+            prods_trunc = truncate_fn(prods, p_eff)
             del prods, p_eff
             block_dots = prods_trunc.sum(dim=-1)                 # (N, c, nb)
             del prods_trunc
@@ -758,7 +798,8 @@ def _find_budget_for_snr(
         p_eff = torch.clamp(b_exp - total_delay, min=0.0)
         del total_delay
 
-        prods_trunc = _msd_truncate(prods, p_eff)
+        _mark_cal_compile_step(device)
+        prods_trunc = truncate_fn(prods, p_eff)
         del prods, p_eff
         block_dots = prods_trunc.sum(dim=-1)
         del prods_trunc
@@ -942,6 +983,7 @@ def calibrate_channel_budgets(
     show_progress=False,
     progress_prefix="",
     detail_layer=2,
+    projection_filter: set[str] | None = None,
 ):
     """
     Run calibration to determine per-channel MSD cycle budgets.
@@ -992,6 +1034,8 @@ def calibrate_channel_budgets(
     mxfp_layers = {}
     for name, module in model.named_modules():
         if isinstance(module, _MXFPLinearBase):
+            if projection_filter and not any(proj in name for proj in projection_filter):
+                continue
             mxfp_layers[name] = module
 
     if not mxfp_layers:
