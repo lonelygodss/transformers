@@ -127,6 +127,9 @@ class Qwen3Config(PreTrainedConfig):
             Use the lightweight MSD statistics path while preserving numerical outputs.
         msd_figure5_layer_cycles (`bool`, *optional*, defaults to `False`):
             Record per-layer cycle details for Figure 5 diagnostics.
+        msd_compile_truncate (`bool`, *optional*, defaults to `False`):
+            Compile the MSD truncation primitive with torch.compile. This is an
+            explicit performance experiment flag; numerical semantics are unchanged.
         use_activation_nm_sparsity (`bool`, *optional*, defaults to `False`):
             Enable runtime activation-only n:m sparsity in MXFP MLP linear layers
             during inference. This mode is intended for inference/evaluation only.
@@ -226,6 +229,7 @@ class Qwen3Config(PreTrainedConfig):
         msd_perf_stats_enabled: bool | None = True,
         msd_perf_stats_lite: bool | None = False,
         msd_figure5_layer_cycles: bool | None = False,
+        msd_compile_truncate: bool | None = False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -292,6 +296,7 @@ class Qwen3Config(PreTrainedConfig):
         self.msd_perf_stats_enabled = msd_perf_stats_enabled
         self.msd_perf_stats_lite = msd_perf_stats_lite
         self.msd_figure5_layer_cycles = msd_figure5_layer_cycles
+        self.msd_compile_truncate = msd_compile_truncate
 
         super().__init__(**kwargs)
 

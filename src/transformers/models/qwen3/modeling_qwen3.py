@@ -215,12 +215,15 @@ def _compute_intra_block_delays(x_q_blocks):
         intra_block_delays: (N, nb, bs) int-valued fp32 tensor
     """
     abs_vals = x_q_blocks.abs()
-    # log2 of absolute value; zeros get large delay
+    # frexp exponent is floor(log2(abs(x))) + 1 for non-zero values.
+    # This is equivalent to floor(log2(abs(x))) and avoids the slower log2 path.
+    _, exponent = torch.frexp(abs_vals)
     elem_log2 = torch.where(
         abs_vals > 0,
-        torch.floor(torch.log2(abs_vals)),
+        (exponent - 1).to(x_q_blocks.dtype),
         torch.tensor(-60.0, dtype=x_q_blocks.dtype, device=x_q_blocks.device),
     )
+    del exponent
     # Per-block max exponent
     e_max_block = elem_log2.amax(dim=-1, keepdim=True)  # (N, nb, 1)
     intra_block_delays = e_max_block - elem_log2  # (N, nb, bs)
@@ -396,6 +399,17 @@ def _msd_truncate(value, num_digits):
         del sign, reconstructed
 
         return result
+
+
+_COMPILED_MSD_TRUNCATE = None
+
+
+def _get_compiled_msd_truncate():
+    """Lazily compile the MSD truncation primitive when explicitly requested."""
+    global _COMPILED_MSD_TRUNCATE
+    if _COMPILED_MSD_TRUNCATE is None:
+        _COMPILED_MSD_TRUNCATE = torch.compile(_msd_truncate, fullgraph=True, mode="reduce-overhead")
+    return _COMPILED_MSD_TRUNCATE
 
 
 # ── Shared base class ────────────────────────────────────────────────────────
@@ -751,6 +765,8 @@ class _MXFPLinearBase(nn.Module):
         _perf = compute_context.perf_stats if compute_context is not None else None
         track_figure5_cycles = bool(_perf is not None and getattr(_perf, "figure5_layer_cycles", False))
         layer_cycle_max = None
+        use_compiled_truncate = bool(getattr(cfg, "msd_compile_truncate", False)) and x_q.device.type == "cuda"
+        truncate_fn = _get_compiled_msd_truncate() if use_compiled_truncate else _msd_truncate
 
         total_chunks = (out + chunk_size - 1) // chunk_size
         for chunk_idx, j0 in enumerate(range(0, out, chunk_size), start=1):
@@ -828,7 +844,9 @@ class _MXFPLinearBase(nn.Module):
             del total_delay  # free 4D tensor early
 
             # 5. Truncate products (BSD/NAF truncation)
-            prods_trunc = _msd_truncate(prods, p_eff)
+            if use_compiled_truncate and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                torch.compiler.cudagraph_mark_step_begin()
+            prods_trunc = truncate_fn(prods, p_eff)
             del prods, p_eff
 
             # 6. Sum within blocks & apply shared scales: (N, c, nb) -> (N, c)
