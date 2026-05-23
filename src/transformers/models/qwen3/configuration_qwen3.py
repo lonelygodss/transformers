@@ -98,8 +98,9 @@ class Qwen3Config(PreTrainedConfig):
         mxfp_weight_cache_dtype (`str`, *optional*, defaults to `"float16"`):
             Persistent quantized-weight cache storage for MXFP layers:
             `"float16"` stores compact quantized values and computes in fp32,
-            `"float32"` keeps the historical cache, and `"none"` recomputes
-            weight quantization each forward.
+            `"float8"` stores native MXFP8 quantized values and computes in
+            fp32, `"float32"` keeps the historical cache, and `"none"`
+            recomputes weight quantization each forward.
         use_msd_truncation (`bool`, *optional*, defaults to `False`):
             Enable MSD-first time-domain truncated dot-product simulation. Only effective
             when one of the MXFP formats (use_mxfp8/6/4) is also active.
@@ -131,12 +132,14 @@ class Qwen3Config(PreTrainedConfig):
             Compile the MSD truncation primitive with torch.compile. This is an
             explicit performance experiment flag; numerical semantics are unchanged.
         use_activation_nm_sparsity (`bool`, *optional*, defaults to `False`):
-            Enable runtime activation-only n:m sparsity in MXFP MLP linear layers
+            Enable runtime activation-only N:M sparsity in MXFP MLP linear layers
             during inference. This mode is intended for inference/evaluation only.
         activation_nm_n (`int`, *optional*, defaults to 2):
-            Number of activation values to prune (set to zero) in each n:m group.
+            Common N:M keep count: number of activation values to keep in each
+            group. Runtime pruning removes `(activation_nm_m - activation_nm_n)`
+            values per group.
         activation_nm_m (`int`, *optional*, defaults to 4):
-            Group size used by activation n:m pruning.
+            Group size used by activation N:M pruning.
         msd_chunk_target_mib (`int`, *optional*, defaults to 512):
             Target size in MiB for the largest intermediate 4D tensor per output chunk
             during MSD truncated dot-product. Controls peak GPU memory: actual peak is

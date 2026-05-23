@@ -341,18 +341,14 @@ def _msd_truncate(value, num_digits):
         truncated: float32 tensor, same shape as value
     """
     with torch.no_grad():
-        abs_v = value.abs()
-        sign = value.sign()
-
         # Scale to integer mantissa: shift so that MSB sits near bit-22/23.
-        # frexp gives abs_v = mantissa * 2**exp with mantissa in [0.5, 1),
-        # so round(mantissa * 2**24) is equivalent to the previous
+        # frexp gives value = mantissa * 2**exp with |mantissa| in [0.5, 1),
+        # so round(abs(mantissa) * 2**24) is equivalent to the previous
         # round(abs_v * 2**(23 - floor(log2(abs_v)))) without materializing
         # log2/pow scale tensors.
-        mantissa, exponent = torch.frexp(abs_v)
-        x_scaled = torch.round(mantissa * (1 << 24)).to(torch.int32)  # int mantissa
+        mantissa, exponent = torch.frexp(value)
+        x_scaled = torch.round(mantissa.abs() * (1 << 24)).to(torch.int32)  # int mantissa
         del mantissa
-        del abs_v
 
         # ── Inline _to_naf_components with early frees ──────────────────────
         # Identity: x_h = x >> 1;  s = x + x_h
@@ -395,8 +391,8 @@ def _msd_truncate(value, num_digits):
             exponent - 24,
         )
         del naf_pos_trunc, naf_neg_trunc, exponent
-        result = sign * reconstructed
-        del sign, reconstructed
+        result = torch.copysign(reconstructed, value)
+        del reconstructed
 
         return result
 
@@ -496,11 +492,13 @@ class _MXFPLinearBase(nn.Module):
     def _weight_cache_dtype(self) -> str:
         cfg = self._msd_config
         dtype = getattr(cfg, "mxfp_weight_cache_dtype", "float16") if cfg is not None else "float16"
-        if dtype not in {"float32", "float16", "none"}:
+        if dtype not in {"float32", "float16", "float8", "none"}:
             raise ValueError(
-                "mxfp_weight_cache_dtype must be one of 'float32', 'float16', or 'none', "
+                "mxfp_weight_cache_dtype must be one of 'float32', 'float16', 'float8', or 'none', "
                 f"got {dtype!r}"
             )
+        if dtype == "float8" and type(self).__name__ != "MXFP8Linear":
+            raise ValueError("mxfp_weight_cache_dtype='float8' is only supported for MXFP8Linear")
         return dtype
 
     def _weight_cache_key(self, cache_dtype: str) -> tuple:
@@ -533,6 +531,8 @@ class _MXFPLinearBase(nn.Module):
             w_q, w_scales, w_pad = self._prepare_blocks(self.weight.float(), self.out_features)
             if cache_dtype == "float16":
                 w_q = w_q.to(torch.float16)
+            elif cache_dtype == "float8":
+                w_q = w_q.to(torch.float8_e4m3fn)
             self._w_cache = (w_q, w_scales, w_pad)
             self._w_cache_key = key
             self._w_cache_data_ptr = self.weight.data_ptr()
@@ -543,9 +543,9 @@ class _MXFPLinearBase(nn.Module):
         """
         Apply per-token activation-only n:m sparsity on quantized activation blocks.
 
-        The sparsity is computed dynamically at inference time by pruning the n
-        smallest-magnitude values in each m-sized group over the flattened
-        activation vector of each token row.
+        The sparsity is computed dynamically at inference time using common N:M
+        notation: keep n values per m-sized group over the flattened activation
+        vector of each token row, and prune the remaining (m - n) values.
         """
         if self._msd_config is None or not getattr(self._msd_config, "use_activation_nm_sparsity", False):
             return x_q
@@ -561,10 +561,11 @@ class _MXFPLinearBase(nn.Module):
             raise ValueError(f"activation_nm_m must be > 0, got {m}")
         if n < 0:
             raise ValueError(f"activation_nm_n must be >= 0, got {n}")
-        if n == 0:
+        if n > m:
+            raise ValueError(f"activation N:M requires n <= m, got n={n}, m={m}")
+        prune_n = m - n
+        if prune_n == 0:
             return x_q
-        if n >= m:
-            raise ValueError(f"activation n:m requires n < m, got n={n}, m={m}")
 
         rows, num_blocks, block_size = x_q.shape
         x_flat = x_q.reshape(rows, num_blocks * block_size)
@@ -574,7 +575,7 @@ class _MXFPLinearBase(nn.Module):
             x_flat = F.pad(x_flat, (0, pad_len), value=0.0)
 
         groups = x_flat.view(rows, -1, m)
-        prune_indices = torch.topk(groups.abs(), k=n, dim=-1, largest=False).indices
+        prune_indices = torch.topk(groups.abs(), k=prune_n, dim=-1, largest=False).indices
 
         mask = torch.ones_like(groups, dtype=torch.bool)
         mask.scatter_(-1, prune_indices, False)
