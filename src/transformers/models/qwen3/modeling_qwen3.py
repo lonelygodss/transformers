@@ -796,9 +796,11 @@ class _MXFPLinearBase(nn.Module):
             combined_e = torch.floor(log2_x + log2_w_c)  # (N, c, nb)
             e_max_c = combined_e.amax(dim=-1)             # (N, c)
             inter_delays_c = e_max_c.unsqueeze(-1) - combined_e  # (N, c, nb)
+            del log2_w_c, combined_e, e_max_c
 
             # 2. Element-wise products: (N, c, nb, bs)
             prods = x_q_exp * w_q_c.unsqueeze(0)  # (N, c, nb, bs)
+            del w_q_c
 
             channel_cycle_chunk = None
             if track_figure5_cycles:
@@ -819,16 +821,23 @@ class _MXFPLinearBase(nn.Module):
                     torch.maximum(layer_cycle_max, chunk_layer_cycle, out=layer_cycle_max)
                 del intra_min, block_delay, block_nonzero, block_cycles, chunk_layer_cycle
 
-            # 3. Total delay: (N, c, nb, bs)
-            total_delay = inter_delays_c.unsqueeze(-1) + intra_exp + online_delay
-
-            # 4. Effective precision: (N, c, nb, bs)
-            # This calcuation yields the width of the results of dot-product in the MSD-first manner,
+            # 3. Effective precision: (N, c, nb, bs)
+            # This calculation yields the width of the results of dot-product in the MSD-first manner,
             # which is the effective precision of the products after the given total delay.
-            p_eff = b_final_c.unsqueeze(-1).unsqueeze(-1) - total_delay
-            p_eff = torch.clamp(p_eff, min=0.0)
+            if _perf is not None:
+                total_delay = inter_delays_c.unsqueeze(-1) + intra_exp + online_delay
+                p_eff = b_final_c.unsqueeze(-1).unsqueeze(-1) - total_delay
+                p_eff = torch.clamp(p_eff, min=0.0)
+            else:
+                # Stats-off PPL does not need materialized total_delay. Build p_eff
+                # in-place from the same terms to avoid one large 4D temporary.
+                p_eff = inter_delays_c.unsqueeze(-1) + intra_exp
+                p_eff.add_(online_delay)
+                p_eff.neg_()
+                p_eff.add_(b_final_c.unsqueeze(-1).unsqueeze(-1))
+                p_eff.clamp_(min=0.0)
 
-            # 4a. Record performance statistics (compute metrics only when needed)
+            # 3a. Record performance statistics (compute metrics only when needed)
             if _perf is not None:
                 max_delay_chunk = total_delay.amax(dim=(0, 2, 3))  # (c,) max over N, nb, bs
                 max_budget_chunk = b_final_c.amax(dim=0)            # (c,) max over N
@@ -841,16 +850,16 @@ class _MXFPLinearBase(nn.Module):
                     channel_cycle_chunk=channel_cycle_chunk,
                 )
                 del naf_width
-            del channel_cycle_chunk
-            del total_delay  # free 4D tensor early
+                del total_delay  # free 4D tensor early
+            del channel_cycle_chunk, b_final_c, inter_delays_c
 
-            # 5. Truncate products (BSD/NAF truncation)
+            # 4. Truncate products (BSD/NAF truncation)
             if use_compiled_truncate and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
                 torch.compiler.cudagraph_mark_step_begin()
             prods_trunc = truncate_fn(prods, p_eff)
             del prods, p_eff
 
-            # 6. Sum within blocks & apply shared scales: (N, c, nb) -> (N, c)
+            # 5. Sum within blocks & apply shared scales: (N, c, nb) -> (N, c)
             block_dots = prods_trunc.sum(dim=-1)
             del prods_trunc
 
@@ -862,7 +871,7 @@ class _MXFPLinearBase(nn.Module):
             # for gpus, which will not be changed in future iterations.
             combined_scales = x_scales_exp * w_scales_c.unsqueeze(0)  # (N, c, nb)
             result[:, j0:j1] = (block_dots * combined_scales).sum(dim=-1)
-            del block_dots, combined_scales, inter_delays_c
+            del block_dots, combined_scales
 
         if track_figure5_cycles and layer_cycle_max is not None:
             _perf.record_layer_cycle(self.layer_name, layer_cycle_max)
