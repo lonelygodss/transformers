@@ -688,20 +688,24 @@ class _MXFPLinearBase(nn.Module):
         result = torch.empty((N, out), dtype=torch.float32, device=x_q.device)
         x_bmm = x_q.permute(1, 0, 2).contiguous()  # (nb, N, bs)
         x_scales_t = x_scales.t().unsqueeze(-1)    # (nb, N, 1)
+        progress_hook = getattr(cfg, "_mxfp_progress_hook", None) if cfg is not None else None
+        report_progress = callable(progress_hook)
 
         total_chunks = (out + chunk_size - 1) // chunk_size
         for chunk_idx, j0 in enumerate(range(0, out, chunk_size), start=1):
             j1 = min(j0 + chunk_size, out)
-            self._report_mxfp_progress(
-                "mx_exact_chunk",
-                chunk_idx=chunk_idx,
-                total_chunks=total_chunks,
-                j0=j0,
-                j1=j1,
-                out_features=out,
-                chunk_size=chunk_size,
-                N=N,
-            )
+            if report_progress:
+                progress_hook(
+                    module=self,
+                    phase="mx_exact_chunk",
+                    chunk_idx=chunk_idx,
+                    total_chunks=total_chunks,
+                    j0=j0,
+                    j1=j1,
+                    out_features=out,
+                    chunk_size=chunk_size,
+                    N=N,
+                )
             w_q_c = w_q[j0:j1]
             if w_q_c.dtype != torch.float32:
                 w_q_c = w_q_c.float()
@@ -757,7 +761,8 @@ class _MXFPLinearBase(nn.Module):
         chunk_size = min(chunk_size, out)  # never exceed actual output dim
 
         # ── Allocate output ──
-        result = torch.zeros(N, out, dtype=torch.float32, device=x_q.device)
+        # Every output slice is assigned exactly once in the chunk loop.
+        result = torch.empty(N, out, dtype=torch.float32, device=x_q.device)
 
         # Pre-expand x for broadcasting (N, 1, nb, bs) — small, shared across chunks
         x_q_exp = x_q.unsqueeze(1)              # (N, 1, nb, bs)
@@ -768,21 +773,25 @@ class _MXFPLinearBase(nn.Module):
         layer_cycle_max = None
         use_compiled_truncate = bool(getattr(cfg, "msd_compile_truncate", False)) and x_q.device.type == "cuda"
         truncate_fn = _get_compiled_msd_truncate() if use_compiled_truncate else _msd_truncate
+        progress_hook = getattr(cfg, "_mxfp_progress_hook", None) if cfg is not None else None
+        report_progress = callable(progress_hook)
 
         total_chunks = (out + chunk_size - 1) // chunk_size
         for chunk_idx, j0 in enumerate(range(0, out, chunk_size), start=1):
             j1 = min(j0 + chunk_size, out)
             c = j1 - j0  # current chunk width
-            self._report_mxfp_progress(
-                "msd_chunk",
-                chunk_idx=chunk_idx,
-                total_chunks=total_chunks,
-                j0=j0,
-                j1=j1,
-                out_features=out,
-                chunk_size=chunk_size,
-                N=N,
-            )
+            if report_progress:
+                progress_hook(
+                    module=self,
+                    phase="msd_chunk",
+                    chunk_idx=chunk_idx,
+                    total_chunks=total_chunks,
+                    j0=j0,
+                    j1=j1,
+                    out_features=out,
+                    chunk_size=chunk_size,
+                    N=N,
+                )
 
             # Slice weight-side tensors along output dim
             w_q_c = w_q[j0:j1]           # (c, nb, bs)
@@ -824,22 +833,18 @@ class _MXFPLinearBase(nn.Module):
             # 3. Effective precision: (N, c, nb, bs)
             # This calculation yields the width of the results of dot-product in the MSD-first manner,
             # which is the effective precision of the products after the given total delay.
-            if _perf is not None:
-                total_delay = inter_delays_c.unsqueeze(-1) + intra_exp + online_delay
-                p_eff = b_final_c.unsqueeze(-1).unsqueeze(-1) - total_delay
-                p_eff = torch.clamp(p_eff, min=0.0)
-            else:
-                # Stats-off PPL does not need materialized total_delay. Build p_eff
-                # in-place from the same terms to avoid one large 4D temporary.
-                p_eff = inter_delays_c.unsqueeze(-1) + intra_exp
-                p_eff.add_(online_delay)
-                p_eff.neg_()
-                p_eff.add_(b_final_c.unsqueeze(-1).unsqueeze(-1))
-                p_eff.clamp_(min=0.0)
+            # Build total delay once, then transform it in-place into p_eff.
+            # This avoids keeping separate full 4D total_delay and p_eff tensors
+            # in both stats-off PPL and stats-lite timing probes.
+            p_eff = inter_delays_c.unsqueeze(-1) + intra_exp
+            p_eff.add_(online_delay)
+            max_delay_chunk = p_eff.amax(dim=(0, 2, 3)) if _perf is not None else None
+            p_eff.neg_()
+            p_eff.add_(b_final_c.unsqueeze(-1).unsqueeze(-1))
+            p_eff.clamp_(min=0.0)
 
             # 3a. Record performance statistics (compute metrics only when needed)
             if _perf is not None:
-                max_delay_chunk = total_delay.amax(dim=(0, 2, 3))  # (c,) max over N, nb, bs
                 max_budget_chunk = b_final_c.amax(dim=0)            # (c,) max over N
                 naf_width = _compute_naf_widths(prods) if not _perf.lite else None
                 _perf.record_chunk(
@@ -850,8 +855,7 @@ class _MXFPLinearBase(nn.Module):
                     channel_cycle_chunk=channel_cycle_chunk,
                 )
                 del naf_width
-                del total_delay  # free 4D tensor early
-            del channel_cycle_chunk, b_final_c, inter_delays_c
+            del channel_cycle_chunk, b_final_c, inter_delays_c, max_delay_chunk
 
             # 4. Truncate products (BSD/NAF truncation)
             if use_compiled_truncate and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
@@ -1736,6 +1740,8 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             hidden_states = outputs.last_hidden_state
             # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
             slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            if torch.is_tensor(slice_indices) and slice_indices.device != hidden_states.device:
+                slice_indices = slice_indices.to(hidden_states.device)
             loss = None
             can_chunk_loss = (
                 labels is not None
@@ -1747,18 +1753,21 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             if can_chunk_loss:
                 chunk_size = max(1, int(loss_token_chunk_size))
                 total_items = (shift_labels != -100).sum()
-                loss_sum = hidden_states.new_zeros((), dtype=torch.float32)
+                loss_sum = None
                 for pos in range(0, int(slice_indices.numel()), chunk_size):
                     chunk_indices = slice_indices[pos : pos + chunk_size]
                     chunk_labels = shift_labels[..., pos : pos + chunk_indices.numel()].reshape(-1)
                     chunk_logits = self.lm_head(hidden_states[:, chunk_indices, :]).float()
-                    loss_sum = loss_sum + F.cross_entropy(
+                    chunk_loss = F.cross_entropy(
                         chunk_logits.reshape(-1, self.config.vocab_size),
                         chunk_labels.to(chunk_logits.device),
                         ignore_index=-100,
                         reduction="sum",
                     )
-                    del chunk_logits, chunk_labels
+                    loss_sum = chunk_loss if loss_sum is None else loss_sum.to(chunk_loss.device) + chunk_loss
+                    del chunk_logits, chunk_labels, chunk_loss
+                if loss_sum is None:
+                    loss_sum = hidden_states.new_zeros((), dtype=torch.float32)
                 loss = loss_sum / total_items.to(loss_sum.device)
                 logits = hidden_states.new_empty((hidden_states.shape[0], 0, self.config.vocab_size))
             else:
