@@ -21,6 +21,7 @@ from typing import Optional
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
@@ -44,9 +45,23 @@ from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, loggi
 from ...utils.generic import maybe_autocast, merge_with_config_defaults
 from ...utils.output_capturing import capture_outputs
 from .configuration_llama import LlamaConfig
+from ..qwen3.modeling_qwen3 import (
+    MSDComputeContext,
+    _MXFP_LINEAR_REGISTRY,
+    _msd_elementwise_mul,
+    _msd_silu,
+)
 
 
 logger = logging.get_logger(__name__)
+
+
+def _make_llama_linear(in_f: int, out_f: int, config) -> nn.Module:
+    """Return an MXFP/MSD-aware linear layer only when onlinearith flags request it."""
+    for flag, cls in _MXFP_LINEAR_REGISTRY.items():
+        if getattr(config, flag, False):
+            return cls(in_f, out_f, bias=getattr(config, "mlp_bias", False), config=config)
+    return nn.Linear(in_f, out_f, bias=config.mlp_bias)
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -174,12 +189,54 @@ class LlamaMLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        self.gate_proj = _make_llama_linear(self.hidden_size, self.intermediate_size, config)
+        self.up_proj = _make_llama_linear(self.hidden_size, self.intermediate_size, config)
+        self.down_proj = _make_llama_linear(self.intermediate_size, self.hidden_size, config)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
+    def forward(self, x, compute_context=None):
+        use_msd = getattr(self.config, "use_msd_truncation", False)
+        use_pipeline = getattr(self.config, "msd_deep_pipeline", False)
+
+        if use_msd and use_pipeline and compute_context is not None:
+            cfg = self.config
+            gate_out = self.gate_proj(x, compute_context=compute_context)
+            up_out = self.up_proj(x, compute_context=compute_context)
+
+            p_gate = float(cfg.msd_cycle_budget)
+            p_up = float(cfg.msd_cycle_budget)
+            if compute_context.pipeline_precision_remaining is not None:
+                p_gate = compute_context.pipeline_precision_remaining
+                p_up = compute_context.pipeline_precision_remaining
+
+            precision_loss = cfg.msd_pipeline_precision_loss
+            if isinstance(p_gate, (int, float)):
+                p_after_silu = max(0, p_gate - precision_loss)
+            else:
+                p_after_silu = torch.clamp(p_gate - precision_loss, min=0.0)
+            silu_out = _msd_silu(gate_out, p_after_silu)
+
+            online_delay = cfg.msd_online_delay
+            if isinstance(p_after_silu, (int, float)):
+                p_after_mul = max(0, min(p_after_silu, p_up) - online_delay)
+            else:
+                p_after_mul = (
+                    torch.clamp(torch.minimum(p_after_silu, p_up) - online_delay, min=0.0)
+                    if not isinstance(p_up, (int, float))
+                    else torch.clamp(p_after_silu - online_delay, min=0.0)
+                )
+            intermediate = _msd_elementwise_mul(silu_out, up_out, p_after_mul)
+
+            compute_context.pipeline_precision_remaining = p_after_mul
+            result = self.down_proj(intermediate, compute_context=compute_context)
+            compute_context.pipeline_precision_remaining = None
+            return result
+        elif use_msd:
+            gate_out = self.gate_proj(x, compute_context=compute_context)
+            up_out = self.up_proj(x, compute_context=compute_context)
+            intermediate = self.act_fn(gate_out) * up_out
+            return self.down_proj(intermediate, compute_context=compute_context)
+
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
@@ -314,6 +371,8 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
+        compute_context = MSDComputeContext.get_active()
+
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
@@ -332,7 +391,7 @@ class LlamaDecoderLayer(GradientCheckpointingLayer):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, compute_context=compute_context)
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -442,6 +501,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_gather_output"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    _msd_context = None
+    _msd_context_config_hash = None
 
     def __init__(self, config):
         super().__init__(config)
@@ -484,33 +545,128 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
-        outputs: BaseModelOutputWithPast = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            **kwargs,
+        shift_labels = kwargs.pop("shift_labels", None)
+        loss_token_chunk_size = kwargs.pop("loss_token_chunk_size", None)
+        output_logits = kwargs.pop("output_logits", True)
+        use_msd = getattr(self.config, "use_msd_truncation", False)
+        has_mxfp = (
+            getattr(self.config, "use_mxfp8", False)
+            or getattr(self.config, "use_mxfp6", False)
+            or getattr(self.config, "use_mxfp4", False)
         )
+        if use_msd and has_mxfp:
+            MSDComputeContext.activate(self._get_msd_context())
+        try:
+            outputs: BaseModelOutputWithPast = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
 
-        hidden_states = outputs.last_hidden_state
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+            hidden_states = outputs.last_hidden_state
+            # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            if torch.is_tensor(slice_indices) and slice_indices.device != hidden_states.device:
+                slice_indices = slice_indices.to(hidden_states.device)
+            loss = None
+            can_chunk_loss = (
+                labels is not None
+                and shift_labels is not None
+                and loss_token_chunk_size is not None
+                and not output_logits
+                and torch.is_tensor(slice_indices)
+            )
+            if can_chunk_loss:
+                chunk_size = max(1, int(loss_token_chunk_size))
+                total_items = (shift_labels != -100).sum()
+                loss_sum = None
+                for pos in range(0, int(slice_indices.numel()), chunk_size):
+                    chunk_indices = slice_indices[pos : pos + chunk_size]
+                    chunk_labels = shift_labels[..., pos : pos + chunk_indices.numel()].reshape(-1)
+                    chunk_logits = self.lm_head(hidden_states[:, chunk_indices, :]).float()
+                    chunk_loss = F.cross_entropy(
+                        chunk_logits.reshape(-1, self.config.vocab_size),
+                        chunk_labels.to(chunk_logits.device),
+                        ignore_index=-100,
+                        reduction="sum",
+                    )
+                    loss_sum = chunk_loss if loss_sum is None else loss_sum.to(chunk_loss.device) + chunk_loss
+                    del chunk_logits, chunk_labels, chunk_loss
+                if loss_sum is None:
+                    loss_sum = hidden_states.new_zeros((), dtype=torch.float32)
+                loss = loss_sum / total_items.to(loss_sum.device)
+                logits = hidden_states.new_empty((hidden_states.shape[0], 0, self.config.vocab_size))
+            else:
+                logits = self.lm_head(hidden_states[:, slice_indices, :])
 
-        loss = None
-        if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            if labels is not None and loss is None:
+                loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
 
-        return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
+            return CausalLMOutputWithPast(
+                loss=loss,
+                logits=logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
+        finally:
+            MSDComputeContext.deactivate()
+
+    def apply_baseline_sparsity(self, mask_dict):
+        """
+        Inject zeros into model weights using the given mask dictionary so that
+        inference is just standard calculation.
+        """
+        for name, module in self.named_modules():
+            if name in mask_dict and hasattr(module, "weight"):
+                mask = mask_dict[name].to(module.weight.device)
+                module.weight.data.mul_(mask)
+
+    def _get_msd_context(self):
+        """Return cached MSDComputeContext, creating or refreshing only when config changes."""
+        cfg = self.config
+        cfg_hash = (
+            getattr(cfg, "use_msd_truncation", False),
+            getattr(cfg, "use_mxfp8", False),
+            getattr(cfg, "use_mxfp6", False),
+            getattr(cfg, "mxfp6_format", "e2m3"),
+            getattr(cfg, "use_mxfp4", False),
+            getattr(cfg, "msd_cycle_budget", 16),
+            getattr(cfg, "msd_online_delay", 2),
+            getattr(cfg, "msd_budget_dynamic_scale", 1.0),
+            getattr(cfg, "msd_budget_dynamic_threshold", 0.0),
+            getattr(cfg, "msd_budget_dynamic_mode", "linear"),
+            getattr(cfg, "msd_deep_pipeline", False),
+            getattr(cfg, "msd_pipeline_precision_loss", 2),
+            id(getattr(cfg, "msd_calibration_data", None)),
+            getattr(cfg, "msd_perf_stats_enabled", True),
+            getattr(cfg, "msd_perf_stats_lite", False),
+            getattr(cfg, "msd_figure5_layer_cycles", False),
         )
+        if self._msd_context is None or self._msd_context_config_hash != cfg_hash:
+            self._msd_context = MSDComputeContext.create_from_config(cfg, self.model)
+            self._msd_context_config_hash = cfg_hash
+        return self._msd_context
+
+    def get_perf_stats(self, detail_layer: int = 2) -> dict | None:
+        """Return finalized MSD performance statistics, or None if MSD is not active."""
+        ctx = self._msd_context
+        if ctx is not None and ctx.perf_stats is not None and ctx.perf_stats.has_data:
+            return ctx.perf_stats.finalize(
+                detail_layer=detail_layer,
+                online_delay=getattr(self.config, "msd_online_delay", 0),
+            )
+        return None
+
+    def reset_perf_stats(self):
+        """Clear accumulated MSD performance statistics."""
+        if self._msd_context is not None and self._msd_context.perf_stats is not None:
+            self._msd_context.perf_stats.reset()
 
 
 class LlamaForSequenceClassification(GenericForSequenceClassification, LlamaPreTrainedModel): ...

@@ -50,6 +50,9 @@ Usage:
     on every forward call.  Retrieve results via model.get_perf_stats().
 """
 
+import csv
+from pathlib import Path
+
 import torch
 
 from ...utils import logging
@@ -151,12 +154,45 @@ class MSDPerfAccumulator:
         lite: bool = False,
         lite_p_eff_cap: float | None = None,
         figure5_layer_cycles: bool = False,
+        boundary_event_ledger: bool = False,
+        boundary_trace_path: str | None = None,
+        boundary_trace_shards: int = 4,
+        boundary_trace_payload_digits_per_word: int = 32,
     ):
         self.lite = lite
         self.lite_p_eff_cap = float(lite_p_eff_cap) if lite_p_eff_cap is not None else None
         self.figure5_layer_cycles = bool(figure5_layer_cycles)
         self._layers: dict[str, _LayerAccumulator] = {}
         self._bin_edges_cache: dict[torch.device, torch.Tensor] = {}
+        self.boundary_trace_path = str(boundary_trace_path) if boundary_trace_path else None
+        self.boundary_event_ledger = bool(boundary_event_ledger or self.boundary_trace_path)
+        self.boundary_trace_shards = max(1, int(boundary_trace_shards))
+        self.boundary_trace_payload_digits_per_word = max(1, int(boundary_trace_payload_digits_per_word))
+        self._boundary_trace_file = None
+        self._boundary_trace_writer = None
+        self._boundary_trace_rows = 0
+        self._boundary_payload_words_by_shard = {str(i): 0 for i in range(self.boundary_trace_shards)}
+        self._boundary_payload_digits_by_shard = {str(i): 0 for i in range(self.boundary_trace_shards)}
+        self._boundary_nonzero_blocks_by_shard = {str(i): 0 for i in range(self.boundary_trace_shards)}
+        self._boundary_bursts_by_shard = {str(i): 0 for i in range(self.boundary_trace_shards)}
+        if self.boundary_trace_path:
+            path = Path(self.boundary_trace_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._boundary_trace_file = path.open("w", newline="", encoding="utf-8")
+            self._boundary_trace_writer = csv.DictWriter(
+                self._boundary_trace_file,
+                fieldnames=[
+                    "layer",
+                    "sample",
+                    "channel",
+                    "shard",
+                    "cycle",
+                    "payload_words",
+                    "payload_digits",
+                    "nonzero_blocks",
+                ],
+            )
+            self._boundary_trace_writer.writeheader()
 
     def _get_or_create_layer(self, layer_name: str, out_features: int, device: torch.device) -> _LayerAccumulator:
         """Get existing accumulator or create a new one for this layer."""
@@ -216,6 +252,8 @@ class MSDPerfAccumulator:
                        this chunk, where each value is the block-serial cycle sum for
                        one sample/channel pair.
         """
+        self.record_boundary_trace(layer_name, p_eff, j0, j1, channel_cycle_chunk)
+
         if self.lite:
             return self._record_chunk_lite(
                 layer_name, p_eff, b_final_c, j0, j1, N, nb, bs,
@@ -416,6 +454,112 @@ class MSDPerfAccumulator:
         acc.channel_cycle_sq_sum[j0:j1] += (cycle_chunk ** 2).sum(dim=0)
         acc.channel_cycle_count[j0:j1] += int(N)
 
+    @property
+    def boundary_trace_enabled(self) -> bool:
+        """True when Anchor3-compatible boundary burst tracing is enabled."""
+        return self._boundary_trace_writer is not None
+
+    @property
+    def boundary_accounting_enabled(self) -> bool:
+        """True when aggregate boundary payload counts are accumulated."""
+        return self.boundary_event_ledger
+
+    def record_boundary_trace(
+        self,
+        layer_name: str,
+        p_eff: torch.Tensor,
+        j0: int,
+        j1: int,
+        channel_cycle_chunk: torch.Tensor | None,
+    ):
+        """Emit per-sample/channel burst rows for Anchor 3 queue replay.
+
+        Each row is one local output-channel burst. `cycle` is the modeled
+        block-serial completion cycle for that sample/channel. `payload_words`
+        is a conservative packing of retained MSD contribution digits into
+        fixed-width boundary words; headers are added later by the Anchor 3
+        queueing harness.
+        """
+        if not self.boundary_event_ledger:
+            return
+
+        with torch.no_grad():
+            payload_digits = torch.ceil(p_eff.clamp(min=0.0)).sum(dim=(2, 3)).to(torch.int64)
+            payload_words = (
+                payload_digits + self.boundary_trace_payload_digits_per_word - 1
+            ) // self.boundary_trace_payload_digits_per_word
+            sample_idx, local_ch = torch.nonzero(payload_words > 0, as_tuple=True)
+            if sample_idx.numel() == 0:
+                return
+
+            nonzero_blocks = p_eff.gt(0).any(dim=-1).sum(dim=-1).to(torch.int64)
+            words_sel = payload_words[sample_idx, local_ch]
+            digits_sel = payload_digits[sample_idx, local_ch]
+            blocks_sel = nonzero_blocks[sample_idx, local_ch]
+            channel_sel = local_ch + int(j0)
+            shard_sel = channel_sel.remainder(self.boundary_trace_shards)
+
+            for shard in range(self.boundary_trace_shards):
+                shard_mask = shard_sel == shard
+                if not bool(shard_mask.any().item()):
+                    continue
+                shard_key = str(shard)
+                self._boundary_payload_words_by_shard[shard_key] += int(words_sel[shard_mask].sum().item())
+                self._boundary_payload_digits_by_shard[shard_key] += int(digits_sel[shard_mask].sum().item())
+                self._boundary_nonzero_blocks_by_shard[shard_key] += int(blocks_sel[shard_mask].sum().item())
+                self._boundary_bursts_by_shard[shard_key] += int(shard_mask.sum().item())
+
+            if self._boundary_trace_writer is None or channel_cycle_chunk is None:
+                return
+
+            cycles = torch.ceil(channel_cycle_chunk.clamp(min=0.0)).to(torch.int64)
+
+            sample_cpu = sample_idx.cpu().tolist()
+            local_ch_cpu = local_ch.cpu().tolist()
+            payload_words_cpu = words_sel.cpu().tolist()
+            payload_digits_cpu = digits_sel.cpu().tolist()
+            cycles_cpu = cycles[sample_idx, local_ch].cpu().tolist()
+            nonzero_blocks_cpu = blocks_sel.cpu().tolist()
+
+        rows = []
+        for sample, local_channel, words, digits, cycle, blocks in zip(
+            sample_cpu,
+            local_ch_cpu,
+            payload_words_cpu,
+            payload_digits_cpu,
+            cycles_cpu,
+            nonzero_blocks_cpu,
+        ):
+            channel = int(j0) + int(local_channel)
+            shard = channel % self.boundary_trace_shards
+            rows.append(
+                {
+                    "layer": layer_name,
+                    "sample": int(sample),
+                    "channel": channel,
+                    "shard": shard,
+                    "cycle": int(cycle),
+                    "payload_words": int(words),
+                    "payload_digits": int(digits),
+                    "nonzero_blocks": int(blocks),
+                }
+            )
+
+        self._boundary_trace_writer.writerows(rows)
+        self._boundary_trace_rows += len(rows)
+        self._boundary_trace_file.flush()
+
+    def _boundary_event_counts(self) -> dict:
+        """Return shard-keyed boundary event counts accumulated during tracing."""
+        if not self.boundary_event_ledger:
+            return {}
+        return {
+            "N_payload_word": dict(self._boundary_payload_words_by_shard),
+            "N_payload_digit": dict(self._boundary_payload_digits_by_shard),
+            "N_nonzero_block_payload": dict(self._boundary_nonzero_blocks_by_shard),
+            "N_burst": dict(self._boundary_bursts_by_shard),
+        }
+
     def record_layer_cycle(self, layer_name: str, layer_cycle_samples: torch.Tensor):
         """Record per-sample layer cycle moments (layer cycle = max channel cycle)."""
         if not self.figure5_layer_cycles:
@@ -429,6 +573,88 @@ class MSDPerfAccumulator:
         acc.layer_cycle_sum += cycles.sum()
         acc.layer_cycle_sq_sum += (cycles ** 2).sum()
         acc.layer_cycle_count += cycles.numel()
+
+    def _boundary_trace_metadata(self) -> dict | None:
+        """Return JSON metadata for an enabled boundary trace."""
+        if not self.boundary_trace_path:
+            return None
+        if self._boundary_trace_file is not None:
+            self._boundary_trace_file.flush()
+        return {
+            "schema": "anchor3_burst_trace_v1",
+            "path": self.boundary_trace_path,
+            "rows": self._boundary_trace_rows,
+            "shards": self.boundary_trace_shards,
+            "payload_digits_per_word": self.boundary_trace_payload_digits_per_word,
+            "totals": self._boundary_event_counts(),
+            "columns": [
+                "layer",
+                "sample",
+                "channel",
+                "shard",
+                "cycle",
+                "payload_words",
+                "payload_digits",
+                "nonzero_blocks",
+            ],
+            "queue_harness": "anchor3/scripts/trace_boundary_queue.py",
+        }
+
+    def _event_ledger_from_counts(
+        self,
+        *,
+        total_blocks: int,
+        zero_blocks: int,
+        p_eff_sum: float,
+        num_layers: int,
+    ) -> dict:
+        """Build an E2E cost-model event ledger from accumulator counters."""
+        n_blk_total = int(total_blocks)
+        n_blk_skip = int(zero_blocks)
+        n_blk_exec = max(n_blk_total - n_blk_skip, 0)
+        n_leaf_exec = int(round(float(p_eff_sum)))
+
+        def split_even(total: int) -> dict[str, int]:
+            g = int(round(total / 2.0))
+            return {"g": g, "u": int(total - g)}
+
+        ledger = {
+            "schema": "tss_event_ledger_v1",
+            "source": "MSDPerfAccumulator",
+            "N_pre_scan": n_blk_total,
+            "N_pre_resolve": n_blk_total,
+            "N_prepass_instance": int(num_layers),
+            "N_cfg_block": split_even(n_blk_total),
+            "N_blk_total": split_even(n_blk_total),
+            "N_blk_exec": split_even(n_blk_exec),
+            "N_blk_skip": split_even(n_blk_skip),
+            "N_leaf_exec": split_even(n_leaf_exec),
+        }
+        boundary = self._boundary_event_counts()
+        if boundary:
+            hdr_words_per_burst = (
+                48 + self.boundary_trace_payload_digits_per_word - 1
+            ) // self.boundary_trace_payload_digits_per_word
+            n_burst = boundary["N_burst"]
+            n_payload = boundary["N_payload_word"]
+            n_hdr = {shard: int(count) * hdr_words_per_burst for shard, count in n_burst.items()}
+            n_boundary = {
+                shard: int(n_payload.get(shard, 0)) + int(n_hdr.get(shard, 0))
+                for shard in n_payload
+            }
+            ledger.update(
+                {
+                    "N_payload_word": n_payload,
+                    "N_burst": n_burst,
+                    "N_hdr_word": n_hdr,
+                    "N_boundary_word": n_boundary,
+                    "boundary_trace_path": self.boundary_trace_path,
+                    "boundary_trace_payload_digits_per_word": self.boundary_trace_payload_digits_per_word,
+                    "boundary_trace_shards": self.boundary_trace_shards,
+                    "boundary_hdr_words_per_burst": hdr_words_per_burst,
+                }
+            )
+        return ledger
 
     def _compute_figure5_cycle_metrics(self, acc: _LayerAccumulator) -> dict | None:
         """Compute Figure 5 cycle metrics from accumulated moments."""
@@ -608,10 +834,20 @@ class MSDPerfAccumulator:
             "max_total_delay": round(g_max_total_delay, 2),
         }
 
-        return {
+        result = {
             "global": global_stats,
             "per_layer": per_layer,
+            "event_ledger": self._event_ledger_from_counts(
+                total_blocks=g_total_blocks,
+                zero_blocks=g_zero_blocks,
+                p_eff_sum=g_p_eff_sum,
+                num_layers=len(self._layers),
+            ),
         }
+        boundary_trace = self._boundary_trace_metadata()
+        if boundary_trace is not None:
+            result["boundary_trace"] = boundary_trace
+        return result
 
     # ──────────────────────────────────────────────────────────────────────
     #  _finalize_lite — compact output for lite mode
@@ -672,10 +908,20 @@ class MSDPerfAccumulator:
             "max_total_delay": round(g_max_total_delay, 2),
         }
 
-        return {
+        result = {
             "global": global_stats,
             "per_layer": per_layer,
+            "event_ledger": self._event_ledger_from_counts(
+                total_blocks=g_total_blocks,
+                zero_blocks=g_zero_blocks,
+                p_eff_sum=g_p_eff_sum,
+                num_layers=len(self._layers),
+            ),
         }
+        boundary_trace = self._boundary_trace_metadata()
+        if boundary_trace is not None:
+            result["boundary_trace"] = boundary_trace
+        return result
 
     def _finalize_layer_lite(self, acc: _LayerAccumulator, online_delay: float) -> dict:
         """Produce compact per-layer stats for lite mode."""
@@ -867,6 +1113,15 @@ class MSDPerfAccumulator:
         """Clear all accumulated statistics."""
         self._layers.clear()
         self._bin_edges_cache.clear()
+        if self._boundary_trace_file is not None:
+            self._boundary_trace_file.close()
+            self._boundary_trace_file = None
+            self._boundary_trace_writer = None
+        self._boundary_trace_rows = 0
+        self._boundary_payload_words_by_shard = {str(i): 0 for i in range(self.boundary_trace_shards)}
+        self._boundary_payload_digits_by_shard = {str(i): 0 for i in range(self.boundary_trace_shards)}
+        self._boundary_nonzero_blocks_by_shard = {str(i): 0 for i in range(self.boundary_trace_shards)}
+        self._boundary_bursts_by_shard = {str(i): 0 for i in range(self.boundary_trace_shards)}
 
     @property
     def has_data(self) -> bool:

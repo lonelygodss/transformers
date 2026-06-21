@@ -109,6 +109,12 @@ class MSDComputeContext:
                 lite=perf_lite,
                 lite_p_eff_cap=lite_p_eff_cap,
                 figure5_layer_cycles=figure5_layer_cycles,
+                boundary_event_ledger=getattr(config, "msd_boundary_event_ledger", False),
+                boundary_trace_path=getattr(config, "msd_boundary_trace_path", None),
+                boundary_trace_shards=getattr(config, "msd_boundary_trace_shards", 4),
+                boundary_trace_payload_digits_per_word=getattr(
+                    config, "msd_boundary_trace_payload_digits_per_word", 32
+                ),
             )
             if perf_enabled
             else None
@@ -770,6 +776,9 @@ class _MXFPLinearBase(nn.Module):
         x_scales_exp = x_scales.unsqueeze(1)     # (N, 1, nb)
         _perf = compute_context.perf_stats if compute_context is not None else None
         track_figure5_cycles = bool(_perf is not None and getattr(_perf, "figure5_layer_cycles", False))
+        track_boundary_accounting = bool(
+            _perf is not None and getattr(_perf, "boundary_accounting_enabled", False)
+        )
         layer_cycle_max = None
         use_compiled_truncate = bool(getattr(cfg, "msd_compile_truncate", False)) and x_q.device.type == "cuda"
         truncate_fn = _get_compiled_msd_truncate() if use_compiled_truncate else _msd_truncate
@@ -812,8 +821,8 @@ class _MXFPLinearBase(nn.Module):
             del w_q_c
 
             channel_cycle_chunk = None
-            if track_figure5_cycles:
-                # Figure 5 cycle model: block delay = inter + min(intra),
+            if track_figure5_cycles or track_boundary_accounting:
+                # Block-serial cycle model: block delay = inter + min(intra),
                 # and block cycle = max(B - block_delay, 0) for non-zero blocks.
                 intra_min = intra_exp.amin(dim=-1)  # (N, 1, nb)
                 block_delay = inter_delays_c + intra_min  # (N, c, nb)
@@ -823,12 +832,14 @@ class _MXFPLinearBase(nn.Module):
                 block_cycles = block_cycles * block_nonzero.to(block_cycles.dtype)
                 channel_cycle_chunk = block_cycles.sum(dim=-1)  # (N, c)
 
-                chunk_layer_cycle = channel_cycle_chunk.max(dim=1).values  # (N,)
-                if layer_cycle_max is None:
-                    layer_cycle_max = chunk_layer_cycle
-                else:
-                    torch.maximum(layer_cycle_max, chunk_layer_cycle, out=layer_cycle_max)
-                del intra_min, block_delay, block_nonzero, block_cycles, chunk_layer_cycle
+                if track_figure5_cycles:
+                    chunk_layer_cycle = channel_cycle_chunk.max(dim=1).values  # (N,)
+                    if layer_cycle_max is None:
+                        layer_cycle_max = chunk_layer_cycle
+                    else:
+                        torch.maximum(layer_cycle_max, chunk_layer_cycle, out=layer_cycle_max)
+                    del chunk_layer_cycle
+                del intra_min, block_delay, block_nonzero, block_cycles
 
             # 3. Effective precision: (N, c, nb, bs)
             # This calculation yields the width of the results of dot-product in the MSD-first manner,
@@ -1813,6 +1824,9 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             getattr(cfg, "msd_perf_stats_enabled", True),
             getattr(cfg, "msd_perf_stats_lite", False),
             getattr(cfg, "msd_figure5_layer_cycles", False),
+            getattr(cfg, "msd_boundary_trace_path", None),
+            getattr(cfg, "msd_boundary_trace_shards", 4),
+            getattr(cfg, "msd_boundary_trace_payload_digits_per_word", 32),
         )
         if self._msd_context is None or self._msd_context_config_hash != cfg_hash:
             self._msd_context = MSDComputeContext.create_from_config(cfg, self.model)

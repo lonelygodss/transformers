@@ -131,6 +131,18 @@ class Qwen3Config(PreTrainedConfig):
         msd_compile_truncate (`bool`, *optional*, defaults to `False`):
             Compile the MSD truncation primitive with torch.compile. This is an
             explicit performance experiment flag; numerical semantics are unchanged.
+        msd_boundary_event_ledger (`bool`, *optional*, defaults to `False`):
+            Accumulate aggregate boundary payload counts in `msd_perf_stats`
+            event-ledger output without requiring a per-burst CSV trace.
+        msd_boundary_trace_path (`str`, *optional*):
+            Optional CSV output path for Anchor3-compatible boundary burst traces.
+            Disabled when unset. When set, aggregate boundary event-ledger
+            accounting is enabled as well.
+        msd_boundary_trace_shards (`int`, *optional*, defaults to 4):
+            Number of local down-projection shards for boundary trace mapping.
+        msd_boundary_trace_payload_digits_per_word (`int`, *optional*, defaults to 32):
+            Number of retained MSD contribution digits packed into one boundary
+            payload word in the trace export.
         use_activation_nm_sparsity (`bool`, *optional*, defaults to `False`):
             Enable runtime activation-only N:M sparsity in MXFP MLP linear layers
             during inference. This mode is intended for inference/evaluation only.
@@ -233,6 +245,10 @@ class Qwen3Config(PreTrainedConfig):
         msd_perf_stats_lite: bool | None = False,
         msd_figure5_layer_cycles: bool | None = False,
         msd_compile_truncate: bool | None = False,
+        msd_boundary_event_ledger: bool | None = False,
+        msd_boundary_trace_path: str | None = None,
+        msd_boundary_trace_shards: int | None = 4,
+        msd_boundary_trace_payload_digits_per_word: int | None = 32,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -300,6 +316,10 @@ class Qwen3Config(PreTrainedConfig):
         self.msd_perf_stats_lite = msd_perf_stats_lite
         self.msd_figure5_layer_cycles = msd_figure5_layer_cycles
         self.msd_compile_truncate = msd_compile_truncate
+        self.msd_boundary_event_ledger = msd_boundary_event_ledger
+        self.msd_boundary_trace_path = msd_boundary_trace_path
+        self.msd_boundary_trace_shards = msd_boundary_trace_shards
+        self.msd_boundary_trace_payload_digits_per_word = msd_boundary_trace_payload_digits_per_word
 
         super().__init__(**kwargs)
 
